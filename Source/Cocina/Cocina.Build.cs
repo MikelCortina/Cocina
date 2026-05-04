@@ -18,7 +18,7 @@ public class Cocina : ModuleRules
 			"StateTreeModule",
 			"GameplayStateTreeModule",
 			"UMG",
-			"Slate"
+			"Slate",
 			"PhotonFusion",
         });
 
