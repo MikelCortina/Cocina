@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "Profile 1": {
+      "commandName": "Executable",
+      "executablePath": "dotnet",
+      "commandLineArgs": "\"$(EngineDir)/Binaries/DotNET/UnrealBuildTool/UnrealBuildTool.dll\" \"-Target=PhotonFusionUnrealEditor Win64 Development -Project=\\\"$(ProjectDir)/../../../../PhotonFusionUnreal.uproject\\\"\" -WaitMutex"
+    }
+  }
+}

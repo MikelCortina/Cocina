@@ -1,0 +1,102 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="PhotonFusionUbtPlugin.ubtplugin.csproj.props" Condition="Exists('PhotonFusionUbtPlugin.ubtplugin.csproj.props')" />
+  <Import Project="$(EngineDir)\Source\Programs\Shared\UnrealEngine.csproj.props" />
+  <PropertyGroup>
+    <!-- UE 5.4 ships .NET 6 SDK; 5.5+ ships .NET 8 -->
+    <TargetFramework Condition="Exists('$(EngineDir)\Binaries\ThirdParty\DotNet\6.0.302')">net6.0</TargetFramework>
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net8.0</TargetFramework>
+    <Configuration Condition=" '$(Configuration)' == '' ">Development</Configuration>
+    <OutputType>Library</OutputType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <Configurations>Debug;Release;Development</Configurations>
+    <RootNamespace>FusionUbtPlugin</RootNamespace>
+    <AssemblyName>PhotonFusionUbtPlugin</AssemblyName>
+    <OutputPath>..\..\..\..\Binaries\DotNET\UnrealBuildTool\Plugins\PhotonFusionUbtPlugin\</OutputPath>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <DebugType>pdbonly</DebugType>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Development|AnyCPU' ">
+    <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
+    <Optimize>true</Optimize>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
+    <Optimize>true</Optimize>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DefineConstants>$(DefineConstants);DEBUG;TRACE</DefineConstants>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="EpicGames.Build">
+      <HintPath>$(EngineDir)\Binaries\DotNET\UnrealBuildTool\EpicGames.Build.dll</HintPath>
+    </Reference>
+    <Reference Include="EpicGames.Core">
+      <HintPath>$(EngineDir)\Binaries\DotNET\UnrealBuildTool\EpicGames.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="EpicGames.UHT">
+      <HintPath>$(EngineDir)\Binaries\DotNET\UnrealBuildTool\EpicGames.UHT.dll</HintPath>
+    </Reference>
+    <Reference Include="UnrealBuildTool">
+      <HintPath>$(EngineDir)\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <None Remove="UhtPropertyExtensions.T4.tt" />
+  </ItemGroup>
+  <!-- Ensure global.json pins the correct .NET SDK version for this engine -->
+  <Target Name="EnsureGlobalJson" BeforeTargets="Restore;Build;Rebuild;CoreCompile">
+    <PropertyGroup>
+      <_UeProjectRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\..\..'))</_UeProjectRoot>
+      <_GlobalJsonPath>$(_UeProjectRoot)\global.json</_GlobalJsonPath>
+      <_IsNet6Engine>false</_IsNet6Engine>
+      <_IsNet6Engine Condition="Exists('$(EngineDir)\Binaries\ThirdParty\DotNet\6.0.302')">true</_IsNet6Engine>
+    </PropertyGroup>
+    <!-- UE 5.4 requires .NET 6 SDK; write global.json to pin it -->
+    <WriteLinesToFile
+      File="$(_GlobalJsonPath)"
+      Lines='{ "sdk": { "version": "6.0.428", "rollForward": "latestPatch" } }'
+      Overwrite="true"
+      Condition="'$(_IsNet6Engine)' == 'true'" />
+    <!-- UE 5.5+ requires .NET 8 SDK -->
+    <WriteLinesToFile
+      File="$(_GlobalJsonPath)"
+      Lines='{ "sdk": { "version": "8.0.100", "rollForward": "latestFeature" } }'
+      Overwrite="true"
+      Condition="'$(_IsNet6Engine)' != 'true'" />
+  </Target>
+  <Target Name="DetectEngineVersion" BeforeTargets="CoreCompile" Condition="Exists('$(EngineDir)\Build\Build.version')">
+    <Exec Command="&quot;$(MSBuildThisFileDirectory)GetEngineMinorVersion.bat&quot; &quot;$(EngineDir)\Build\Build.version&quot;"
+          Condition="'$(OS)' == 'Windows_NT'"
+          ConsoleToMsBuild="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_EngineMinorVersion" />
+    </Exec>
+    <Exec Command="sh &quot;$(MSBuildThisFileDirectory)GetEngineMinorVersion.sh&quot; &quot;$(EngineDir)/Build/Build.version&quot;"
+          Condition="'$(OS)' != 'Windows_NT'"
+          ConsoleToMsBuild="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_EngineMinorVersion" />
+    </Exec>
+    <CreateProperty Value="$(DefineConstants);UE_5_4_OR_LATER" Condition="'$(_EngineMinorVersion)' &gt;= '4'">
+      <Output TaskParameter="Value" PropertyName="DefineConstants" />
+    </CreateProperty>
+    <CreateProperty Value="$(DefineConstants);UE_5_5_OR_LATER" Condition="'$(_EngineMinorVersion)' &gt;= '5'">
+      <Output TaskParameter="Value" PropertyName="DefineConstants" />
+    </CreateProperty>
+    <CreateProperty Value="$(DefineConstants);UE_5_6_OR_LATER" Condition="'$(_EngineMinorVersion)' &gt;= '6'">
+      <Output TaskParameter="Value" PropertyName="DefineConstants" />
+    </CreateProperty>
+    <CreateProperty Value="$(DefineConstants);UE_5_7_OR_LATER" Condition="'$(_EngineMinorVersion)' &gt;= '7'">
+      <Output TaskParameter="Value" PropertyName="DefineConstants" />
+    </CreateProperty>
+  </Target>
+</Project>
