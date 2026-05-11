@@ -7,15 +7,15 @@
 
 #include "Fusion/Client.h"
 
-#include "Types/TypeDescriptor.h"
+#include "Types/FusionTypeDescriptor.h"
 #include "CoreMinimal.h"
 #include "FusionHelpers.h"
 #include "FusionNetDriver.h"
 #include "FusionOnlineSubsystem.h"
-#include "ObjectActorPair.h"
+#include "FusionObjectActorPair.h"
 #include "Components/ActorComponent.h"
-#include "Types/PropertyHelpers.h"
-#include "Types/TypeLookup.h"
+#include "Types/FusionPropertyHelpers.h"
+#include "Types/FusionTypeLookup.h"
 #include "UObject/Class.h"
 #include "FusionClient.generated.h"
 
@@ -70,6 +70,7 @@ enum class EMapState : uint8
 	MasterClientChangeWorld,
 	HasRequestToChangeLevel,
 	IsLoading,
+	WaitingToAttach,
 	ReadyToNotifyAboutLevelLoad,
 	Shutdown,
 };
@@ -77,7 +78,7 @@ enum class EMapState : uint8
 
 struct FDeferredDependency
 {
-	FObjectActorPair Pair;
+	FFusionObjectActorPair Pair;
 };
 
 USTRUCT(BlueprintType)
@@ -102,14 +103,11 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	GENERATED_BODY()
 
 	friend UFusionHelpers;
-	friend class UTypeDescriptor;
+	friend class UFusionTypeDescriptor;
 	friend class Property;
 	friend class ObjectProperty;
 	friend class ArrayProperty;
 	friend class FusionArrayProperty;
-
-	bool bPreviousMasterClientState = false;
-	int32 SequenceIncrementAmount = 1;
 
 	FMapInstance TargetMapInstance;
 	FMapInstance CurrentMapInstance;
@@ -137,7 +135,8 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	bool bRunUnderOneProcess{false};
 	FString DriverName;
 	bool bSocketInBgThread{false};
-	bool bBlockNextDestroy{false};
+
+	TSet<const UObject*> RemoteDestroyedObjects;
 	
 	std::atomic_bool MainThreadReady{};
 	std::atomic_bool BackThreadDone{};
@@ -154,10 +153,10 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	TArray<FPendingObject> PendingObjects{};
 
 	UPROPERTY()
-	TMap<FKeyObjectId, FObjectActorPair> ObjectIdToPair{};
+	TMap<FKeyObjectId, FFusionObjectActorPair> ObjectIdToPair{};
 
 	UPROPERTY()
-	TMap<FKeyObjectId, FObjectActorPair> TempObjectIdToPair{};
+	TMap<FKeyObjectId, FFusionObjectActorPair> TempObjectIdToPair{};
 	
 	UPROPERTY()
 	TMap<TObjectPtr<UObject>, uint64> ObjectToObjectId{};
@@ -165,12 +164,12 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	UPROPERTY()
 	TMap<TObjectPtr<UObject>, uint64> TempObjectToObjectId{};
 	
-	TArray<SharedMode::ObjectRoot*> NewRemoteObjectRoots{};
-	TArray<SharedMode::ObjectChild*> NewRemoteObjectChildren{};
+	TArray<FusionCore::ObjectRoot*> NewRemoteObjectRoots{};
+	TArray<FusionCore::ObjectChild*> NewRemoteObjectChildren{};
 	
 	TMap<FKeyObjectId, TArray<FDeferredDependency>> DependencyChecks;
 	
-	TArray<SharedMode::ObjectId> RemoveAfterEndBeginFrame{};
+	TArray<FusionCore::ObjectId> RemoveAfterEndBeginFrame{};
 
 	FWorldChangeRequest WorldChangeRequest;
 
@@ -179,10 +178,10 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	void SetMapState(EMapState NewMapState);
 	
 	void AttachMapActor(UFusionActorComponent* Source, uint32 MapSequence, bool SendUpdates);
-	void AttachGlobalInstanceActor(UObject* Object);
+	void AttachGlobalInstanceActor(UFusionActorComponent* Source, const uint32 MapSequence, UObject* Object);
 	void AttachSpawnedActor(UFusionActorComponent* Source, uint32 Scene, bool SendUpdates);
-	SharedMode::ObjectRoot* FindRootParent(SharedMode::ObjectId Id);
-	SharedMode::Object* CreateCustomObject(const FCopyContext& Context, UObject* Object, const UTypeDescriptor* Descriptor, uint32 Scene);
+	FusionCore::ObjectRoot* FindRootParent(FusionCore::ObjectId Id);
+	FusionCore::Object* CreateCustomObject(const FCopyContext& Context, UObject* Object, const UFusionTypeDescriptor* Descriptor, uint32 Scene);
 	void TriggerMapLoad();
 	void TriggerMapLoadedCallback();
 	
@@ -192,16 +191,15 @@ class PHOTONFUSION_API UFusionClient : public UObject
 
 	void TickInRoomAndRunningEndFrame(double Dt);
 	void TickInRoomAndRunningBeginFrame(double Dt);
-	void UpdateRemoteState(const FObjectActorPair& Pair, const struct FPackagedSettings& Settings, const double Dt);
+	void UpdateRemoteState(const FFusionObjectActorPair& Pair, const struct FPackagedSettings& Settings, const double Dt);
 	void TickInRoomAndRunningRemoveActors();
 
 
-	void CheckForMasterChange();
 	void AddSpawnBlockedCls(UClass* InClass);
 	void RemoveSpawnBlockedCls(UClass* InClass);
 
-	void CopyLocalStateToObject(FObjectActorPair& Pair);
-	void CopyRemoteStateToObject(FCopyContext& Context, const FObjectActorPair& Pair, bool IsInitialUpdate = false);
+	void CopyLocalStateToObject(FFusionObjectActorPair& Pair);
+	void CopyRemoteStateToObject(FCopyContext& Context, const FFusionObjectActorPair& Pair, bool IsInitialUpdate = false);
 
 	void InvokeOnReps(UObject* Container, TSet<FRepValue>& Set);
 
@@ -216,23 +214,25 @@ class PHOTONFUSION_API UFusionClient : public UObject
 	UPROPERTY()
 	TObjectPtr<UFusionNetDriver> FusionNetDriver = nullptr;
 
-	UObject* RemoveObjectPairs(const SharedMode::ObjectId Id);
-	UObject* RemoveObjectRoot(const SharedMode::ObjectRoot* Root);
+	UPROPERTY()
+	TObjectPtr<class UFusionRealtimeClient> RealtimeClient = nullptr;
+
+	UObject* RemoveObjectPairs(const FusionCore::ObjectId Id);
+	UObject* RemoveObjectRoot(const FusionCore::ObjectRoot* Root);
 	
-	SharedMode::Client* Client{nullptr};
+	FusionCore::Client* Client{nullptr};
 	PhotonCommon::SubscriptionBag ClientSubscriptionBag;
 	
 	TMap<uint32, TSet<FKeyObjectId>> DestroyedMapActors;
 
-	SharedMode::ObjectId CurrentPlayerStateId;
-
+	FusionCore::ObjectId CurrentPlayerStateId;
 
 public:
 
 	UPROPERTY()
-	TWeakObjectPtr<UTypeLookup> Lookup;
+	TWeakObjectPtr<UFusionTypeLookup> Lookup;
 
-	SharedMode::Client* GetClient() const { return Client; }
+	FusionCore::Client* GetClient() const { return Client; }
 	
 	void AttachCurrentMap(UWorld* World);
 	void AttachCurrentMap_Internal(UWorld* World);
@@ -261,13 +261,12 @@ public:
 	// KeyFunc receives each actor and returns its area key (0 = global / no area filtering).
 	void UpdateOwnedActorAreaInterestKeys(TFunctionRef<uint64(const AActor*)> KeyFunc);
 
-	void SendUserRpc(const int64 Id, const SharedMode::PlayerId Player, const AActor* Actor, const char* Data, SIZE_T DataLength);
+	void SendUserRpc(const int64 Id, const FusionCore::PlayerId Player, const AActor* Actor, const char* Data, SIZE_T DataLength);
 	void SendCustomRPC(const UObject* Source, const FString& EventName, uint64 RPCId, EFusionRPCTarget Target, const TArray<uint8>& Buffer, ERPCMode RPCMode);
 	
 	virtual ~UFusionClient() override;
-	FObjectActorPair RegisterObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, SharedMode::Object* FusionObject, EObjectPairType Type);
-	FObjectActorPair RegisterRuntimeObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, SharedMode::Object* FusionObject, EObjectPairType Type);
-
+	FFusionObjectActorPair RegisterObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, FusionCore::Object* FusionObject, EFusionObjectPairType Type);
+	FFusionObjectActorPair RegisterRuntimeObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, FusionCore::Object* FusionObject, EFusionObjectPairType Type);
 
 	void Tick(double Dt);
 	void TriggerLevelChanged(const FString& MapName, bool AttachCurrent = false);
@@ -278,43 +277,51 @@ public:
 	
 	FString GetLevelName() const { return CurrentMapInstance.Name; }
 
-	void AddDependencyCheck(SharedMode::ObjectId Id, const FCopyContext& Root, const TFunction<bool()>& Callback);
+	void UpdateGameState();
+
+	void AddDependencyCheck(FusionCore::ObjectId Id, const FCopyContext& Root, const TFunction<bool()>& Callback);
 	
 	//
 	void AddActorSource(UFusionActorComponent* Source);
 
-	SharedMode::ObjectId FindObjectId(const UObject* Object);
-	UObject* FindObject(SharedMode::ObjectId Id);
-	FObjectActorPair FindObjectPair(SharedMode::ObjectId Id);
-	SharedMode::Object* FindObject(const UObject* Object);
-	SharedMode::ObjectRoot* FindObjectRoot(const UObject* Actor);
+	FusionCore::ObjectId FindObjectId(const UObject* Object);
+	UObject* FindObject(FusionCore::ObjectId Id);
+	FFusionObjectActorPair FindObjectPair(FusionCore::ObjectId Id);
+	FusionCore::Object* FindObject(const UObject* Object);
+	FusionCore::ObjectRoot* FindObjectRoot(const UObject* Actor);
 
 	void OnActorSpawned(AActor* SpawnedActor);
-	void OnEngineObjectDestroyed(const UObject* DestroyedObject, bool bEngineObjectDestroyed);
+	void OnEngineObjectDestroyed(AActor* AActor);
 	
-	void Startup(UWorld* InitialWorld, UTypeLookup* TypeLookup, const UPhotonOnlineSubsystemSettings* const Settings, PhotonMatchmaking::RealtimeClient& InRealtimeClient);
+	void Startup(UWorld* InitialWorld, UFusionTypeLookup* TypeLookup, const UFusionOnlineSubsystemSettings* const Settings, TObjectPtr<class UFusionRealtimeClient> FusionRealtimeClient);
 	void Shutdown();
 	
 	void OnForcedDisconnect(FString Message);
 
-	void OnObjectReady(SharedMode::ObjectRoot* Obj);
-	void OnSubObjectCreated(SharedMode::ObjectChild* Obj);
-	void OnSubObjectDestroyed(SharedMode::ObjectChild* Obj, SharedMode::DestroyModes Mode);
+	void OnObjectReady(FusionCore::ObjectRoot* Obj);
+	void OnSubObjectCreated(FusionCore::ObjectChild* Obj);
+	void OnSubObjectDestroyed(FusionCore::ObjectChild* Obj, FusionCore::DestroyModes Mode);
 
-	void CopyToBackBuffer(const FObjectActorPair& Pair);
-	bool OnObjectCreatedFinalize(SharedMode::Object* Obj);
-	void OnObjectDestroyed(const SharedMode::ObjectRoot* Obj, SharedMode::DestroyModes Mode);
+	void CopyToBackBuffer(FFusionObjectActorPair& Pair);
+	bool OnObjectCreatedFinalize(FusionCore::Object* Obj);
+	void OnObjectDestroyed(const FusionCore::ObjectRoot* Obj, FusionCore::DestroyModes Mode);
 
-	void OnMapActorDestroyedRemote(uint32 SceneSequence, const SharedMode::ObjectId Id, const SharedMode::DestroyModes Mode);
+	void OnMapActorDestroyedRemote(uint32 SceneSequence, const FusionCore::ObjectId Id, const FusionCore::DestroyModes Mode);
+
+	void OnFusionStart();
 	
-	void OnSceneChange(uint32 Index, uint32 Sequence, SharedMode::Data Data);
-	void OnRpcReceived(const SharedMode::Rpc& Rpc);
+	void OnMapChange(const std::unordered_map<FusionCore::Map, FusionCore::Data> &Maps, bool Initial);
+	void OnRpcReceived(const FusionCore::Rpc& Rpc);
 	bool IsLoadingMap();
 
 	void OnMapInit(UWorld* World);
 	void PreMapLoad(const FWorldContext& WorldContext, const FString& MapName, bool bIsSeamlessTravel = false);
 	void PostMapLoad(UWorld* LoadedWorld);
 	void OnMapDestroy(UWorld* World);
+
+	void OnLevelAdded(ULevel* Level, UWorld* World);
+	void OnLevelRemoved(ULevel* Level, UWorld* World);
+
 
 	void SendSocketToBackgroundThread();
 	void RetrieveSocketFromBackgroundThread();

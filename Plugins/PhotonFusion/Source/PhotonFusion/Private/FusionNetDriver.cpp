@@ -6,9 +6,10 @@
 #include "FusionClient.h"
 #include "FusionNetConnection.h"
 #include "FusionOnlineSubsystem.h"
+#include "Fusion/Buffers.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/GameInstance.h"
-#include "Types/TypeDescriptor.h"
+#include "Types/FusionTypeDescriptor.h"
 
 #include "UObject/Package.h"
 
@@ -67,12 +68,12 @@ void UFusionNetDriver::ProcessRemoteFunction(AActor* Actor, UFunction* Function,
 	UObject* TargetType = SubObject != nullptr ? SubObject : Actor;
 
 	//Ensure that the backing event is mapped on a descriptor.
-	if (UTypeDescriptor* Descriptor = OnlineSubsystem->GFusionClient->Lookup->FindClassDescriptor(TargetType->GetClass()); Descriptor && Descriptor->EventFunctions.Contains(EventName))
+	if (UFusionTypeDescriptor* Descriptor = OnlineSubsystem->GFusionClient->Lookup->FindClassDescriptor(TargetType->GetClass()); Descriptor && Descriptor->EventFunctions.Contains(EventName))
 	{
-		TArray<uint8> Buffer;
-		TObjectPtr<UFunctionDescriptor> EvtFunction = Descriptor->EventFunctions[EventName];
+		SharedMode::WriteBuffer WriteBuffer;
+		TObjectPtr<UFusionFunctionDescriptor> EvtFunction = Descriptor->EventFunctions[EventName];
 
-		for (FFunctionProperty FunctionProperty : EvtFunction->FunctionProperties)
+		for (FFusionFunctionProperty FunctionProperty : EvtFunction->FunctionProperties)
 		{
 			uint8* Ptr = static_cast<uint8*>(Parameters) + FunctionProperty.WordOffset;
 
@@ -80,8 +81,16 @@ void UFusionNetDriver::ProcessRemoteFunction(AActor* Actor, UFunction* Function,
 			{
 				Property* Property = EvtFunction->Properties[i];
 				check(Property);
-				Property->Serialize(OnlineSubsystem->GFusionClient, Ptr, FunctionProperty, Buffer, true);
+				Property->Serialize(OnlineSubsystem->GFusionClient, Ptr, FunctionProperty, WriteBuffer, true);
 			}
+		}
+
+		TArray<uint8> Buffer;
+		FusionCore::Data Data = WriteBuffer.Take();
+		if (Data.Valid())
+		{
+			Buffer.Append(Data.Ptr, Data.Length);
+			Data.Free();
 		}
 
 		if (Function->FunctionFlags & FUNC_NetMulticast)

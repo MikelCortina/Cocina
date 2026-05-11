@@ -5,7 +5,7 @@
 #include "FusionClient.h"
 #include "FusionOnlineSubsystem.h"
 #include "FusionShared.h"
-#include "Types/TypeDescriptor.h"
+#include "Types/FusionTypeDescriptor.h"
 #include "Kismet/GameplayStatics.h"
 #include "Engine/GameInstance.h"
 #include "Engine/SCS_Node.h"
@@ -17,7 +17,8 @@
 #include "EngineGlobals.h"  
 #include "FusionActorComponent.h"
 #include "CoreMinimal.h"
-
+#include "Serialization/JsonReader.h"
+#include "Dom/JsonObject.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -76,7 +77,7 @@ void UFusionHelpers::InvokeCustomRPC(UObject* Source, const FString EventName, c
 	OnlineSubsystem->SendCustomRPC(Source, EventName, RPCId, Target, Buffer, ERPCMode::FusionRPC);
 }
 
-UFunctionDescriptor* UFusionHelpers::GetFunctionDescriptor(UObject* Source, const FString EventName)
+UFusionFunctionDescriptor* UFusionHelpers::GetFunctionDescriptor(UObject* Source, const FString EventName)
 {
 	const UGameInstance* GameInstance = UGameplayStatics::GetGameInstance(Source);
 	if (!GameInstance)
@@ -89,10 +90,10 @@ UFunctionDescriptor* UFusionHelpers::GetFunctionDescriptor(UObject* Source, cons
 		return nullptr;
 	}
 
-	if (UTypeLookup* Lookup = OnlineSubsystem->GFusionClient->Lookup.Get())
+	if (UFusionTypeLookup* Lookup = OnlineSubsystem->GFusionClient->Lookup.Get())
 	{
 		UClass* Cls = Source->GetClass();
-		UTypeDescriptor* Descriptor = Lookup->FindClassDescriptor(Cls);
+		UFusionTypeDescriptor* Descriptor = Lookup->FindClassDescriptor(Cls);
 
 		//Ensure that the backing event is mapped on a descriptor.
 		if (Descriptor && Descriptor->EventFunctions.Contains(EventName))
@@ -104,7 +105,7 @@ UFunctionDescriptor* UFusionHelpers::GetFunctionDescriptor(UObject* Source, cons
 	return nullptr;
 }
 
-void UFusionHelpers::AddParamToBuffer([[maybe_unused]] const int32& Value, [[maybe_unused]] UObject* Source, [[maybe_unused]] UFunctionDescriptor* Descriptor, [[maybe_unused]] int32 PropertyIndex, [[maybe_unused]] TArray<uint8>& Buffer)
+void UFusionHelpers::AddParamToBuffer([[maybe_unused]] const int32& Value, [[maybe_unused]] UObject* Source, [[maybe_unused]] UFusionFunctionDescriptor* Descriptor, [[maybe_unused]] int32 PropertyIndex, [[maybe_unused]] TArray<uint8>& Buffer)
 {
 	// this method is empty on purpose, do not change that.
 }
@@ -118,7 +119,7 @@ DEFINE_FUNCTION(UFusionHelpers::execAddParamToBuffer)
 
 	P_GET_OBJECT(UObject, Source)
 
-	P_GET_OBJECT(UFunctionDescriptor, Descriptor)
+	P_GET_OBJECT(UFusionFunctionDescriptor, Descriptor)
 
 	P_GET_PROPERTY(FIntProperty, PropertyIndex);
 	
@@ -221,7 +222,7 @@ FString UFusionHelpers::GetTypesHeader(const UFusionClient* Client, TArray<FType
 	
 	for (const FTypeData TypeData : TypesData)
 	{
-		if (const TStrongObjectPtr<UTypeDescriptor> Descriptor = Client->Lookup->HashToDescriptor.FindRef(
+		if (const TStrongObjectPtr<UFusionTypeDescriptor> Descriptor = Client->Lookup->HashToDescriptor.FindRef(
 			TypeData.TypeRef.Hash))
 		{
 			FString ClassPath = Descriptor->Type.Get()->GetPathName();
@@ -332,7 +333,7 @@ bool UFusionHelpers::IsAllowedWorldContext(UFusionClient* Client, const FWorldCo
 
 	if (ContextType != Client->ClientInstanceType)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("UFusionOnlineSubsystem::OnPostMapLoad: Wrong instance type"));
+		UE_LOG(LogFusion, Warning, TEXT("UFusionOnlineSubsystem::OnPostMapLoad: Wrong instance type"));
 		return false;
 	}
 	
@@ -423,4 +424,13 @@ bool UFusionHelpers::DestroyActorComponent(UActorComponent* Component)
 	Owner->RemoveInstanceComponent(Component);
 	Component->DestroyComponent();
 	return true;
+}
+
+TSharedPtr<FJsonObject> UFusionHelpers::DeserializeMapPayload(const FString PayloadString)
+{
+	TSharedPtr<FJsonObject> JsonObject;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PayloadString);
+	FJsonSerializer::Deserialize(Reader, JsonObject);
+
+	return JsonObject;
 }

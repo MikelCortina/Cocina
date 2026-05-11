@@ -2,11 +2,11 @@
 
 #include "FusionRealtimeClient.h"
 #include "FusionUtils.h"
-#include "PhotonOnlineSubsystemSettings.h"
+#include "FusionOnlineSubsystemSettings.h"
 
 UFusionRealtimeClient* UFusionRealtimeClient::CreateRealtimeClient(FFusionConnectOptions Options)
 {
-	const UPhotonOnlineSubsystemSettings* Settings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
+	const UFusionOnlineSubsystemSettings* Settings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();
 
 	PhotonMatchmaking::ClientConstructOptions ConstructOptions = Options.ToClientConstructOptions(Settings->AppId, Settings->AppVersion);
 

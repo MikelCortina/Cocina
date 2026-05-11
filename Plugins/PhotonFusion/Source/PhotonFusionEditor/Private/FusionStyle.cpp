@@ -21,7 +21,7 @@ void FFusionStyle::Initialize()
 	FString ContentDir = IPluginManager::Get().FindPlugin(TEXT("PhotonFusion"))->GetBaseDir() / TEXT("Resources");
 	StyleInstance->SetContentRoot(ContentDir);
 	
-	const FString ClassIconPath = ContentDir / TEXT("Icon16.png");
+	const FString ClassIconPath = ContentDir / TEXT("Icon32.png");
 	const FVector2D ClassIconSize(16, 16);
 
 	StyleInstance->Set("Fusion.Icon128", new FSlateImageBrush(ContentDir / TEXT("Icon128.png"), FVector2D(16,16)));

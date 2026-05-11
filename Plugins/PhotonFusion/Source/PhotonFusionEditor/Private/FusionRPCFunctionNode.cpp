@@ -15,7 +15,7 @@
 #include "FusionOnlineSubsystem.h"
 #include "FusionStyle.h"
 #include "K2Node_CustomEvent.h"
-#include "PhotonFusionEditor.h"
+#include "FusionEditor.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_GetSubsystem.h"
 #include "K2Node_IfThenElse.h"
@@ -29,6 +29,32 @@
 #include "Kismet2/KismetEditorUtilities.h"
 
 #define LOCTEXT_NAMESPACE "FusionCustomRPCEvent"
+
+namespace
+{
+	template <typename TProperty>
+	FProperty* MakeProperty(UFunction* Function, const TSharedPtr<FUserPinInfo>& Pin, EObjectFlags Flags)
+	{
+		return new TProperty(Function, Pin->PinName, Flags);
+	}
+
+	FProperty* MakeRealProperty(UFunction* Function, const TSharedPtr<FUserPinInfo>& Pin, EObjectFlags Flags)
+	{
+		if (Pin->PinType.PinSubCategory == UEdGraphSchema_K2::PC_Double)
+		{
+			return new FDoubleProperty(Function, Pin->PinName, Flags);
+		}
+		return new FFloatProperty(Function, Pin->PinName, Flags);
+	}
+
+	FProperty* MakeStructProperty(UFunction* Function, const TSharedPtr<FUserPinInfo>& Pin, EObjectFlags Flags)
+	{
+		FStructProperty* Prop = new FStructProperty(Function, Pin->PinName, Flags);
+		// Without this, load-time logs: "Struct type unknown for property ..."
+		Prop->Struct = Cast<UScriptStruct>(Pin->PinType.PinSubCategoryObject.Get());
+		return Prop;
+	}
+}
 
 void UFusionRPCFunctionNode::ExpandNode(FKismetCompilerContext& CompilerContext, UEdGraph* SourceGraph)
 {
@@ -481,69 +507,30 @@ UFunction* UFusionRPCFunctionNode::CreateOrUpdateFunction(UBlueprint* Blueprint,
 
 FProperty* UFusionRPCFunctionNode::MakePropertyFromPin(UFunction* Function, const TSharedPtr<FUserPinInfo>& Pin, EObjectFlags Flags) const
 {
-	const FString& Category = Pin->PinType.PinCategory.ToString();
+	using FPropertyFactory = FProperty* (*)(UFunction*, const TSharedPtr<FUserPinInfo>&, EObjectFlags);
 
-	if (Category == UEdGraphSchema_K2::PC_Byte)
+	static const TMap<FName, FPropertyFactory> Factories = {
+		{ UEdGraphSchema_K2::PC_Byte,    &MakeProperty<FByteProperty>   },
+		{ UEdGraphSchema_K2::PC_Boolean, &MakeProperty<FBoolProperty>   },
+		{ UEdGraphSchema_K2::PC_Int,     &MakeProperty<FIntProperty>    },
+		{ UEdGraphSchema_K2::PC_Int64,   &MakeProperty<FInt64Property>  },
+		{ UEdGraphSchema_K2::PC_Float,   &MakeProperty<FFloatProperty>  },
+		{ UEdGraphSchema_K2::PC_Double,  &MakeProperty<FDoubleProperty> },
+		{ UEdGraphSchema_K2::PC_String,  &MakeProperty<FStrProperty>    },
+		{ UEdGraphSchema_K2::PC_Name,    &MakeProperty<FNameProperty>   },
+		{ UEdGraphSchema_K2::PC_Enum,    &MakeProperty<FEnumProperty>   },
+		{ UEdGraphSchema_K2::PC_Object,  &MakeProperty<FObjectProperty> },
+		{ UEdGraphSchema_K2::PC_Class,   &MakeProperty<FClassProperty>  },
+		{ UEdGraphSchema_K2::PC_Real,    &MakeRealProperty              },
+		{ UEdGraphSchema_K2::PC_Struct,  &MakeStructProperty            },
+	};
+
+	if (const FPropertyFactory* Factory = Factories.Find(Pin->PinType.PinCategory))
 	{
-		return new FByteProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Boolean)
-	{
-		return new FBoolProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Int)
-	{
-		return new FIntProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Int64)
-	{
-		return new FInt64Property(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Float)
-	{
-		return new FFloatProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Double)
-	{
-		return new FDoubleProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Real)
-	{
-		if (Pin->PinType.PinSubCategory == UEdGraphSchema_K2::PC_Double)
-		{
-			return new FDoubleProperty(Function, Pin->PinName, Flags);
-		}
-		else
-		{
-			return new FFloatProperty(Function, Pin->PinName, Flags);
-		}
-	}
-	else if (Category == UEdGraphSchema_K2::PC_String)
-	{
-		return new FStrProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Name)
-	{
-		return new FNameProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Enum)
-	{
-		return new FEnumProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Struct)
-	{
-		return new FStructProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Object)
-	{
-		return new FObjectProperty(Function, Pin->PinName, Flags);
-	}
-	else if (Category == UEdGraphSchema_K2::PC_Class)
-	{
-		return new FClassProperty(Function, Pin->PinName, Flags);
+		return (*Factory)(Function, Pin, Flags);
 	}
 
-	UE_LOG(PhotonFusionEditorLog, Warning, TEXT("Unable to make property for a pin: '%s'"), *Category);
+	UE_LOG(PhotonFusionEditorLog, Warning, TEXT("Unable to make property for a pin: '%s'"), *Pin->PinType.PinCategory.ToString());
 
 	return nullptr;
 }

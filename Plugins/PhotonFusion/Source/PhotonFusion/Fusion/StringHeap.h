@@ -1,7 +1,6 @@
 // Copyright 2026 Exit Games GmbH. All Rights Reserved.
 
-#ifndef STRINGHEAP_H
-#define STRINGHEAP_H
+#pragma once
 
 #include <cstdint>
 #include <vector>
@@ -10,7 +9,7 @@
 #include "Buffers.h"
 #include "StringType.h"
 
-namespace SharedMode
+namespace FusionCore
 {
 
     enum class StringMessage {
@@ -77,7 +76,6 @@ namespace SharedMode
         NetworkedStringHeap(uint32_t size = 0)
         {
             SegmentInfos.resize(256);
-
             entries.resize(128);
             free_by_offset.resize(128);
 
@@ -116,5 +114,4 @@ namespace SharedMode
     };
 }
 
-
-#endif //STRINGHEAP_H
+#include "SharedModeCompat.h"

@@ -51,21 +51,24 @@ void UFusionPhysicsReplicationComponent::BeginPlay()
 // ReSharper disable once CppParameterMayBeConstPtrOrRef
 void UFusionPhysicsReplicationComponent::OnHitCallback([[maybe_unused]] UPrimitiveComponent* HitComp, AActor* OtherActor, [[maybe_unused]] UPrimitiveComponent* OtherComp, [[maybe_unused]] FVector NormalImpulse, [[maybe_unused]] const FHitResult& Hit)
 {
+	const UFusionOnlineSubsystem* OnlineSubsystem = UGameplayStatics::GetGameInstance(GetOwner())->GetSubsystem<UFusionOnlineSubsystem>();
+	if (!OnlineSubsystem || !OnlineSubsystem->IsConnected())
+		return;
+
 	if (OtherActor)
 	{
-		if (const UFusionOnlineSubsystem* OnlineSubsystem = UGameplayStatics::GetGameInstance(GetOwner())->GetSubsystem<
-			UFusionOnlineSubsystem>())
-		{
-			OnlineSubsystem->RegisterForecastCollision(this);
-		}
+		OnlineSubsystem->RegisterForecastCollision(this);
 	}
 }
 
 void UFusionPhysicsReplicationComponent::OnTransformUpdated([[maybe_unused]] USceneComponent* InRootComponent, [[maybe_unused]] EUpdateTransformFlags UpdateTransformFlags, const ETeleportType Teleport)
 {
+	const UFusionOnlineSubsystem* OnlineSubsystem = UGameplayStatics::GetGameInstance(GetWorld())->GetSubsystem<UFusionOnlineSubsystem>();
+	if (!OnlineSubsystem || !OnlineSubsystem->IsConnected())
+		return;
+	
 	// Detect if this was an intentional teleport
-	if (const UFusionOnlineSubsystem* OnlineSubsystem = UGameplayStatics::GetGameInstance(GetWorld())->GetSubsystem<
-		UFusionOnlineSubsystem>(); Teleport == ETeleportType::TeleportPhysics && OnlineSubsystem->CanModify(GetOwner()))
+	if ( Teleport == ETeleportType::TeleportPhysics && OnlineSubsystem->CanModify(GetOwner()))
 	{
 		// Increase the Teleport key so that teleports can be identified on the remote clients.
 		// This value is synced with the BodyState in the next tick.

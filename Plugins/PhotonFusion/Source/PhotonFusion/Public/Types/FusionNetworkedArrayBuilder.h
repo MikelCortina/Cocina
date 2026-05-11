@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "CustomTypeDescriptorBuilder.h"
+#include "FusionCustomTypeDescriptorBuilder.h"
 #include "FusionNetworkedArrayBuilder.generated.h"
 
 
@@ -11,10 +11,10 @@
  * 
  */
 UCLASS()
-class PHOTONFUSION_API UFusionNetworkedArrayBuilder : public UCustomTypeDescriptorBuilder
+class PHOTONFUSION_API UFusionNetworkedArrayBuilder : public UFusionCustomTypeDescriptorBuilder
 {
 	GENERATED_BODY()
 
 public:
-	virtual TStrongObjectPtr<UTypeDescriptor> CreateDescriptor(UTypeLookup* Lookup, UStruct* Type, FProperty* ParentProperty, FPropertyBuildOptions BuildOptions) override;
+	virtual TStrongObjectPtr<UFusionTypeDescriptor> CreateDescriptor(UFusionTypeLookup* Lookup, UStruct* Type, FProperty* ParentProperty, FPropertyBuildOptions BuildOptions) override;
 };

@@ -12,7 +12,6 @@
 
 #include "Fusion/ClientConstructOptions.h"
 #include "Fusion/CreateRoomOptions.h"
-#include "Fusion/LogOutput.h"
 #include "Fusion/Broadcaster.h"
 #include "Fusion/SubscriptionBag.h"
 
@@ -91,6 +90,9 @@ struct FFusionRoomOptions
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Fusion")
 	bool bIsVisible = true;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Fusion")
+	TSoftObjectPtr<UWorld> InitialWorld;
+
 	PhotonMatchmaking::CreateRoomOptions ToCreateRoomOptions() const
 	{
 		PhotonMatchmaking::CreateRoomOptions Options{};
@@ -119,6 +121,9 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
+	UFUNCTION(BlueprintCallable, Category="Fusion")
+	void TestTick(UWorld* World, float DeltaTime);
+	
 	void WorldTick(UWorld* World, ELevelTick LevelTick, float DeltaTime);
 
 	bool IsLoadingMap();
@@ -154,36 +159,33 @@ public:
 	static void SetEditorDevelopmentFrameRateLimits();
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UConnectToPhotonAsync* ConnectToPhoton(const FFusionConnectOptions Options, UObject* WorldContextObject);
+	class UFusionConnectToPhotonAsync* ConnectToPhoton(const FFusionConnectOptions Options, UObject* WorldContextObject);
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UDisconnectFromPhotonAsync* DisconnectFromPhoton(UObject* WorldContextObject);
+	class UFusionDisconnectFromPhotonAsync* DisconnectFromPhoton(UObject* WorldContextObject);
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UJoinOrCreateRoomAsync* JoinOrCreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
+	class UFusionJoinOrCreateRoomAsync* JoinOrCreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	UJoinOrCreateRoomAsync* JoinOrCreateRandomRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
+	UFusionJoinOrCreateRoomAsync* JoinOrCreateRandomRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UCreateRoomAsync* CreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
+	class UFusionCreateRoomAsync* CreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject);
 	
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UJoinRoomAsync* JoinRoom(const FString RoomName, UObject* WorldContextObject);
+	class UFusionJoinRoomAsync* JoinRoom(const FString RoomName, UObject* WorldContextObject);
 
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	UJoinRoomAsync* JoinRandomRoom(UObject* WorldContextObject);
+	UFusionJoinRoomAsync* JoinRandomRoom(UObject* WorldContextObject);
 
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class UConnectAndJoinRoomAsync* ConnectAndJoinRoom(const FFusionConnectOptions ConnectOptions, const FFusionRoomOptions RoomOptions, UObject* WorldContextObject);
+	class UFusionConnectAndJoinRoomAsync* ConnectAndJoinRoom(const FFusionConnectOptions ConnectOptions, const FFusionRoomOptions RoomOptions, UObject* WorldContextObject);
 
 	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Photon")
-	class ULeaveRoomAsync* LeaveRoom(UObject* WorldContextObject);
-
+	class UFusionLeaveRoomAsync* LeaveRoom(UObject* WorldContextObject);
+	
 	bool StartFusionSession();
-
-	UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"), Category = "Fusion")
-	bool StartFusionSession(UObject* WorldContextObject, TSoftObjectPtr<UWorld> InitialWorld = nullptr);
 
 	void StopFusionSession();
 
@@ -289,10 +291,10 @@ public:
 	UPARAM(DisplayName="Valid")
 	bool CurrentRoomInfo(FString& Name, int32& Players) const;
 
-	class UTypeLookup* GetTypeLookup() const;
+	class UFusionTypeLookup* GetTypeLookup() const;
 
 	UPROPERTY()
-	TObjectPtr<UFusionRealtimeClient> RealtimeClient;
+	TObjectPtr<class UFusionRealtimeClient> RealtimeClient;
 
 	UPROPERTY()
 	TObjectPtr<UFusionClient> GFusionClient;
@@ -304,16 +306,17 @@ public:
 private:
 	void OnMapDestroy(UWorld* LoadedWorld);
 	void OnMapInit(UWorld* LoadedWorld, UWorld::InitializationValues InitValues);
-	void OnActorSpawned(AActor* SpawnedActor);
-	void OnActorDestroyed(AActor* DestroyedActor);
 	void OnPreMapLoad(const FWorldContext& Context, const FString& MapName);
 	void OnPostMapLoad(UWorld* LoadedWorld);
+
+	void OnLevelAdded(ULevel* Level, UWorld* World);
+	void OnLevelRemoved(ULevel* Level, UWorld* World);
 
 	void OnEndPIE(bool bIsSimulating);
 	void Close();
 
 	UPROPERTY()
-	TObjectPtr<class UTypeLookup> Lookup;
+	TObjectPtr<class UFusionTypeLookup> Lookup;
 	
 	FDelegateHandle OnMapDestroyDelegate{};
 	FDelegateHandle OnMapInitDelegate{};
@@ -322,11 +325,11 @@ private:
 	FDelegateHandle MapPreLoadDelegateHandle{};
 	
 	FDelegateHandle OnWorldTickStartDelegate{};
-	
-	FDelegateHandle OnActorSpawnedHandle{};
-	FDelegateHandle OnActorDestroyedHandle{};
 
 	FDelegateHandle OnEngineExitHandle{};
+
+	FDelegateHandle OnLevelAddedDelegate{};
+	FDelegateHandle OnLevelRemovedDelegate{};
 
 #if WITH_EDITOR
 	FDelegateHandle EndPIEDelegateHandle{};
@@ -335,10 +338,6 @@ private:
 	uint64 LastTickFrame = UINT64_MAX;
 
 	bool bRunUnderOneProcess{false};
-	
-	// Array to keep track of log outputs used by the library.
-	// This is so they can be cleaned up when the subsystem is deinitialized.
-	TArray<PhotonCommon::LogOutput*> LogOutputArr;
 
 	// Bridges Broadcaster events to UE delegates so call sites only need one Broadcast() call.
 	PhotonCommon::SubscriptionBag BridgeSubscriptions;

@@ -5,29 +5,63 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Fusion/Types.h"
-#include "PhotonOnlineSubsystemSettings.h"
+#include "FusionOnlineSubsystemSettings.h"
 #include "Fusion/Broadcaster.h"
 #include "Fusion/Client.h"
 #include "FusionActorComponent.generated.h"
+
+enum class ObjectSpecialFlags : uint8
+{
+	None = 0,
+	IsRootTransform = 1 << 1,
+	IgnoreRootTransformProperties = 1 << 2,
+};
+
+inline ObjectSpecialFlags operator&(ObjectSpecialFlags a, ObjectSpecialFlags b)
+{
+	return static_cast<ObjectSpecialFlags>(static_cast<uint8>(a) & static_cast<uint8>(b));
+}
+
+inline ObjectSpecialFlags operator|(ObjectSpecialFlags a, ObjectSpecialFlags b)
+{
+	return static_cast<ObjectSpecialFlags>(static_cast<uint8>(a) | static_cast<uint8>(b));
+}
+
+inline ObjectSpecialFlags& operator|=(ObjectSpecialFlags& a, ObjectSpecialFlags b)
+{
+	a = a | b;
+	return a;
+}
 
 UENUM(BlueprintType)
 enum class EFusionObjectOwnerFlags : uint8
 {
 	// Used for most objects, allows players to take and release ownership with transaction semantics
-	Transaction = static_cast<uint8>(SharedMode::ObjectOwnerModes::Transaction),
+	Transaction = static_cast<uint8>(FusionCore::ObjectOwnerModes::Transaction),
 
 	// Same as transaction but if a player is currently the owner of the object when he leaves, the object is destroyed
-	PlayerAttached = static_cast<uint8>(SharedMode::ObjectOwnerModes::PlayerAttached),
+	PlayerAttached = static_cast<uint8>(FusionCore::ObjectOwnerModes::PlayerAttached),
 
 	// Allows dynamic overriding of ownership on every client, useful for things that quickly changes ownership such as physics objects, etc.
-	Dynamic = static_cast<uint8>(SharedMode::ObjectOwnerModes::Dynamic),
+	Dynamic = static_cast<uint8>(FusionCore::ObjectOwnerModes::Dynamic),
 
 	// Object is always owned by who's considered to be the master client currently, if a new master client is sellected it automatically switches to him
-	MasterClient = static_cast<uint8>(SharedMode::ObjectOwnerModes::MasterClient),
+	MasterClient = static_cast<uint8>(FusionCore::ObjectOwnerModes::MasterClient),
 
 	// Object lifetime and ownership must be handled explicitly.
-	GameGlobal = static_cast<uint8>(SharedMode::ObjectOwnerModes::GameGlobal)
+	GameGlobal = static_cast<uint8>(FusionCore::ObjectOwnerModes::GameGlobal)
 };
+
+UENUM(BlueprintType, Meta = (Bitflags, UseEnumValuesAsMaskValuesInEditor = "true"))
+enum class EObjectSpecialFlags : uint8
+{
+	None = 0 UMETA(Hidden),
+	IsRootTransform = 1 << 1,
+	IgnoreRootTransformProperties = 1 << 2,
+	SceneObject = 1 << 3,
+	ExistsOnClient = 1 << 4,
+};
+ENUM_CLASS_FLAGS(EObjectSpecialFlags);
 
 USTRUCT(BlueprintType)
 struct FFusionComponentRef
@@ -46,12 +80,12 @@ struct FTypeData
 {
 	GENERATED_BODY()
 
-	SharedMode::TypeRef TypeRef;
+	FusionCore::TypeRef TypeRef;
 	
 	UPROPERTY()
 	TWeakObjectPtr<UObject> Object;
 
-	SharedMode::ObjectSpecialFlags SpecialFlags{};
+	EObjectSpecialFlags SpecialFlags{};
 };
 
 class UFusionActorComponent;
@@ -91,7 +125,7 @@ enum class EFusionObjectDestroyMode : uint8
 {
 	Local = 0 UMETA(DisplayName = "Local"),
 	Remote = 1 UMETA(DisplayName = "Remote"),
-	SceneChange = 2 UMETA(DisplayName = "Scene Change"),
+	MapChange = 2 UMETA(DisplayName = "Map Change"),
 	Shutdown = 3 UMETA(DisplayName = "Shutdown"),
 	RejectedNotOwner = 4 UMETA(DisplayName = "Rejected Not Owner"),
 	ForceDestroy = 5 UMETA(DisplayName = "Force Destroy")
@@ -121,11 +155,11 @@ public:
 	bool bAutomaticallySendUpdates{true};
 
 	// Set how the local state is copied to the networked state
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Fusion")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Fusion")
 	ELocalStateCopyMode LocalStateCopyMode = ELocalStateCopyMode::Auto;
 
 	// When in Manual mode, request this actor's local state be copied to the networked state in the next tick
-	UFUNCTION(BlueprintCallable, Category="Fusion")
+	UFUNCTION(BlueprintCallable, Category = "Fusion")
 	void CopyLocalStateNextFrame();
 
 	bool ConsumePendingLocalStateCopy();
@@ -136,7 +170,7 @@ public:
 	UPROPERTY(EditAnywhere, Category="Fusion")
 	EFusionObjectOwnerFlags Ownership{0};
 
-	SharedMode::ObjectSpecialFlags FusionObjectFlags{SharedMode::ObjectSpecialFlags::None};
+	EObjectSpecialFlags FusionObjectFlags{EObjectSpecialFlags::None};
 	
 	UPROPERTY(EditAnywhere, Category = "Fusion")
 	bool bForecastPhysicsEnabled{true};
@@ -208,20 +242,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Fusion")
 	void ToggleNetworkSend(bool bToggle);
 	
-	SharedMode::ObjectOwnerModes GetOwnerMode();
+	FusionCore::ObjectOwnerModes GetOwnerMode();
 
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	
-	SharedMode::ObjectOwnerModes GetTypes(const class UFusionClient* Client,  TSet<UActorComponent*> Components, USceneComponent* RootComponent, TArray<FTypeData>& OutTypeData);
+	FusionCore::ObjectOwnerModes GetTypes(const class UFusionClient* Client,  TSet<UActorComponent*> Components, USceneComponent* RootComponent, TArray<FTypeData>& OutTypeData);
 	
 	void CheckPhysicsReplication(const class UFusionClient* Client, AActor* Actor, TArray<FTypeData>& OutTypeData);
 	
 	FPackagedSettings PackageSettings();
 	
 	void RemoveEvents();
-	void SubscribeEvents(SharedMode::Client* Client, SharedMode::ObjectId Id);
+	void SubscribeEvents(FusionCore::Client* Client, FusionCore::ObjectId Id);
 	
 	UPROPERTY(BlueprintAssignable, Category="Fusion")
 	FFusionObjectStatusChange OnObjectReady;

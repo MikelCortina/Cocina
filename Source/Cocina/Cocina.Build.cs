@@ -19,7 +19,7 @@ public class Cocina : ModuleRules
 			"GameplayStateTreeModule",
 			"UMG",
 			"Slate",
-			"PhotonFusion",
+            "PhotonFusion"
         });
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });

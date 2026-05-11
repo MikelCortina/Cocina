@@ -2,12 +2,12 @@
 
 #include "Types/FusionNetworkedArrayBuilder.h"
 
-TStrongObjectPtr<UTypeDescriptor> UFusionNetworkedArrayBuilder::CreateDescriptor(UTypeLookup* Lookup, UStruct* Type, FProperty* ParentProperty, FPropertyBuildOptions BuildOptions)
+TStrongObjectPtr<UFusionTypeDescriptor> UFusionNetworkedArrayBuilder::CreateDescriptor(UFusionTypeLookup* Lookup, UStruct* Type, FProperty* ParentProperty, FPropertyBuildOptions BuildOptions)
 {
 	const FString ClassId = Type->GetName();
 	const uint64 TypeHash = CityHash64(TCHAR_TO_ANSI(*ClassId), ClassId.Len());
 
-	TStrongObjectPtr<UTypeDescriptor> Descriptor = TStrongObjectPtr(NewObject<UTypeDescriptor>(Lookup));
+	TStrongObjectPtr<UFusionTypeDescriptor> Descriptor = TStrongObjectPtr(NewObject<UFusionTypeDescriptor>(Lookup));
 	
 	Descriptor->Type = TStrongObjectPtr(Type);
 	Descriptor->TypeHash = TypeHash;

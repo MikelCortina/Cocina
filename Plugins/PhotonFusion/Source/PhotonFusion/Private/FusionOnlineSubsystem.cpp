@@ -2,23 +2,20 @@
 // ReSharper disable CppUnusedIncludeDirective
 
 #include "FusionOnlineSubsystem.h"
-#include "Actions/DisconnectFromPhotonAsync.h"
-#include "Actions/ConnectAndJoinRoomAsync.h"
-#include "Actions/ConnectToPhotonAsync.h"
-#include "Actions/JoinOrCreateRoomAsync.h"
+#include "Actions/FusionDisconnectFromPhotonAsync.h"
+#include "Actions/FusionConnectAndJoinRoomAsync.h"
+#include "Actions/FusionConnectToPhotonAsync.h"
+#include "Actions/FusionJoinOrCreateRoomAsync.h"
 #include "Fusion/Aliases.h"
-#include "Fusion/LogUtils.h"
-#include "Fusion/LogOutput.h"
 #include "Physics/FusionPhysicsReplicationComponent.h"
-#include "Logging/FusionStandardLogOutput.h"
-#include "Logging/FusionOnScreenDebugMessageLogOutput.h"
 #include "FusionClient.h"
 #include "FusionHelpers.h"
+#include "FusionShared.h"
 #include "FusionUtils.h"
-#include "PhotonOnlineSubsystemSettings.h"
-#include "Actions/CreateRoomAsync.h"
-#include "Actions/JoinRoomAsync.h"
-#include "Actions/LeaveRoomAsync.h"
+#include "FusionOnlineSubsystemSettings.h"
+#include "Actions/FusionCreateRoomAsync.h"
+#include "Actions/FusionJoinRoomAsync.h"
+#include "Actions/FusionLeaveRoomAsync.h"
 #include "FusionRealtimeClient.h"
 #include "Fusion/RealtimeClient.h"
 #include "Kismet/GameplayStatics.h"
@@ -41,6 +38,9 @@
 // ReSharper restore CppUnusedIncludeDirective
 
 #include "FusionCVars.h"
+#include "GameFramework/GameStateBase.h"
+#include "Types/FusionGameStateDescriptorBuilder.h"
+#include "Matchmaking/FusionMatchmakingHelpers.h"
 
 namespace FusionCVars
 {
@@ -71,38 +71,23 @@ void UFusionOnlineSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	MapLoadDelegateHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &UFusionOnlineSubsystem::OnPostMapLoad);
 	MapPreLoadDelegateHandle = FCoreUObjectDelegates::PreLoadMapWithContext.AddUObject(this, &UFusionOnlineSubsystem::OnPreMapLoad);
 
+	OnLevelAddedDelegate = FWorldDelegates::LevelAddedToWorld.AddUObject(this, &UFusionOnlineSubsystem::OnLevelAdded);
+	OnLevelRemovedDelegate = FWorldDelegates::LevelRemovedFromWorld.AddUObject(this, &UFusionOnlineSubsystem::OnLevelRemoved);
+
 #if WITH_EDITOR
 	EndPIEDelegateHandle = FEditorDelegates::EndPIE.AddUObject(this, &UFusionOnlineSubsystem::OnEndPIE);
 #endif
 	
-	const UPhotonOnlineSubsystemSettings* Settings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
-
-	// Set up the log outputs
-	if (Settings->EnabledLogOutput & StaticCast<uint8>(ESharedModeLogOutput::StandardLogOutput))
-	{
-		FusionStandardLogOutput* LogOutput = new FusionStandardLogOutput();
-		LogOutputArr.Add(LogOutput);
-		PhotonCommon::AddLogOutput(LogOutput);
-	}
-
-	if (Settings->EnabledLogOutput & StaticCast<uint8>(ESharedModeLogOutput::OnScreenDebugMessageLogOutput))
-	{
-		FusionOnScreenDebugMessageLogOutput* LogOutput = new FusionOnScreenDebugMessageLogOutput();
-		LogOutputArr.Add(LogOutput);
-		PhotonCommon::AddLogOutput(LogOutput);
-	}
-
-	// Set up the log levels to output
-	PhotonCommon::SetLogLevelsFromBitmask(Settings->EnabledLogLevels);
-
 	//Holds all our type data.
-	Lookup = NewObject<UTypeLookup>();
+	Lookup = NewObject<UFusionTypeLookup>();
 
-	FPropertyBuildOptions BuildOptions { EBuildStructOptions::SkipNotReplicated };
+	FPropertyBuildOptions BuildOptions { EFusionBuildStructOptions::SkipNotReplicated };
 	Lookup->CreateTypeDescriptor(UFusionPhysicsReplicationComponent::StaticClass(), BuildOptions);
 	
 	//Register custom types we want networked (serialize/deserialize)
 	Lookup->RegisterTypeBuilder(FFusionNetworkedArray::StaticStruct(), UFusionNetworkedArrayBuilder::StaticClass());
+
+	Lookup->RegisterTypeBuilder(AGameStateBase::StaticClass(), UFusionGameStateDescriptorBuilder::StaticClass());
 
 	// Bridge Broadcaster events to UE delegates so call sites only need one Broadcast() call
 	BridgeSubscriptions += OnMapLoadRequestedEvent.Subscribe([this](const FString& MapName) {
@@ -128,6 +113,9 @@ void UFusionOnlineSubsystem::Deinitialize()
 	FWorldDelegates::OnWorldTickStart.Remove(OnWorldTickStartDelegate);
 	FWorldDelegates::OnWorldBeginTearDown.Remove(OnMapDestroyDelegate);
 	FWorldDelegates::OnPreWorldInitialization.Remove(OnMapInitDelegate);
+
+	FWorldDelegates::LevelAddedToWorld.Remove(OnLevelAddedDelegate);
+	FWorldDelegates::LevelRemovedFromWorld.Remove(OnLevelRemovedDelegate);
 	
 	FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(MapLoadDelegateHandle);
 	FCoreUObjectDelegates::PreLoadMapWithContext.Remove(MapPreLoadDelegateHandle);
@@ -152,9 +140,17 @@ void UFusionOnlineSubsystem::Deinitialize()
 	Lookup = nullptr;
 }
 
+void UFusionOnlineSubsystem::TestTick(UWorld* World, float DeltaTime)
+{
+	if (GFusionClient)
+	{
+		GFusionClient->Tick(DeltaTime);
+	}
+}
+
 void UFusionOnlineSubsystem::OnEndPIE(bool bIsSimulating)
 {
-	UE_LOG(LogTemp, Display, TEXT("UFusionOnlineSubsystem::OnEndPIE: %d"), bIsSimulating);
+	UE_LOG(LogFusion, Display, TEXT("UFusionOnlineSubsystem::OnEndPIE: %d"), bIsSimulating);
 	Close();
 }
 
@@ -165,20 +161,27 @@ void UFusionOnlineSubsystem::Close()
 		GFusionClient->Shutdown();
 	}
 
+	if (RealtimeClient && RealtimeClient->IsValid() && RealtimeClient->IsConnected())
+	{
+		auto DisconnectTask = RealtimeClient->GetClient()->Disconnect();
+
+		const double TimeoutSeconds = 5.0;
+		const double StartTime = FPlatformTime::Seconds();
+		while (!DisconnectTask.IsReady())
+		{
+			if (FPlatformTime::Seconds() - StartTime > TimeoutSeconds)
+			{
+				FUSION_LOG_WARN("Disconnect timed out during Close()");
+				break;
+			}
+			RealtimeClient->Service();
+			FPlatformProcess::Sleep(0.01f);
+		}
+	}
+
 	SetFusionClient(nullptr);
 
 	RealtimeClient = nullptr;
-
-	for (PhotonCommon::LogOutput* LogOutput : LogOutputArr)
-	{
-		if (!PhotonCommon::RemoveLogOutput(LogOutput))
-		{
-			UE_LOG(LogFusion, Error, TEXT("Error removing Fusion log output"));
-		}
-		delete LogOutput;
-	}
-
-	LogOutputArr.Empty();
 }
 
 void UFusionOnlineSubsystem::WorldTick([[maybe_unused]] UWorld* World, [[maybe_unused]] ELevelTick LevelTick, const float DeltaTime)
@@ -257,9 +260,9 @@ void UFusionOnlineSubsystem::SetEditorDevelopmentFrameRateLimits()
 	UserSettings->ApplySettings(true);
 }
 
-UConnectToPhotonAsync* UFusionOnlineSubsystem::ConnectToPhoton(const FFusionConnectOptions Options, UObject* WorldContextObject)
+UFusionConnectToPhotonAsync* UFusionOnlineSubsystem::ConnectToPhoton(const FFusionConnectOptions Options, UObject* WorldContextObject)
 {
-	if (UConnectToPhotonAsync* Action = UConnectToPhotonAsync::ConnectToPhoton(Options, WorldContextObject))
+	if (UFusionConnectToPhotonAsync* Action = UFusionConnectToPhotonAsync::ConnectToPhoton(Options, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -268,9 +271,9 @@ UConnectToPhotonAsync* UFusionOnlineSubsystem::ConnectToPhoton(const FFusionConn
 	return nullptr;
 }
 
-UDisconnectFromPhotonAsync* UFusionOnlineSubsystem::DisconnectFromPhoton(UObject* WorldContextObject)
+UFusionDisconnectFromPhotonAsync* UFusionOnlineSubsystem::DisconnectFromPhoton(UObject* WorldContextObject)
 {
-	if (UDisconnectFromPhotonAsync* Action = UDisconnectFromPhotonAsync::DisconnectFromPhoton(WorldContextObject))
+	if (UFusionDisconnectFromPhotonAsync* Action = UFusionDisconnectFromPhotonAsync::DisconnectFromPhoton(WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -279,9 +282,9 @@ UDisconnectFromPhotonAsync* UFusionOnlineSubsystem::DisconnectFromPhoton(UObject
 	return nullptr;
 }
 
-UJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
+UFusionJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
 {
-	if (UJoinOrCreateRoomAsync* Action = UJoinOrCreateRoomAsync::JoinOrCreateRoom(Options, WorldContextObject))
+	if (UFusionJoinOrCreateRoomAsync* Action = UFusionJoinOrCreateRoomAsync::JoinOrCreateRoom(Options, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -290,9 +293,9 @@ UJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRoom(const FFusionRo
 	return nullptr;
 }
 
-UJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRandomRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
+UFusionJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRandomRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
 {
-	if (UJoinOrCreateRoomAsync* Action = UJoinOrCreateRoomAsync::JoinOrCreateRandomRoom(Options, WorldContextObject))
+	if (UFusionJoinOrCreateRoomAsync* Action = UFusionJoinOrCreateRoomAsync::JoinOrCreateRandomRoom(Options, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -301,9 +304,9 @@ UJoinOrCreateRoomAsync* UFusionOnlineSubsystem::JoinOrCreateRandomRoom(const FFu
 	return nullptr;
 }
 
-UCreateRoomAsync* UFusionOnlineSubsystem::CreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
+UFusionCreateRoomAsync* UFusionOnlineSubsystem::CreateRoom(const FFusionRoomOptions Options, UObject* WorldContextObject)
 {
-	if (UCreateRoomAsync* Action = UCreateRoomAsync::CreateRoom(Options, WorldContextObject))
+	if (UFusionCreateRoomAsync* Action = UFusionCreateRoomAsync::CreateRoom(Options, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -312,9 +315,9 @@ UCreateRoomAsync* UFusionOnlineSubsystem::CreateRoom(const FFusionRoomOptions Op
 	return nullptr;
 }
 
-UJoinRoomAsync* UFusionOnlineSubsystem::JoinRoom(const FString RoomName, UObject* WorldContextObject)
+UFusionJoinRoomAsync* UFusionOnlineSubsystem::JoinRoom(const FString RoomName, UObject* WorldContextObject)
 {
-	if (UJoinRoomAsync* Action = UJoinRoomAsync::JoinRoom(RoomName, WorldContextObject))
+	if (UFusionJoinRoomAsync* Action = UFusionJoinRoomAsync::JoinRoom(RoomName, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -323,9 +326,9 @@ UJoinRoomAsync* UFusionOnlineSubsystem::JoinRoom(const FString RoomName, UObject
 	return nullptr;
 }
 
-UJoinRoomAsync* UFusionOnlineSubsystem::JoinRandomRoom(UObject* WorldContextObject)
+UFusionJoinRoomAsync* UFusionOnlineSubsystem::JoinRandomRoom(UObject* WorldContextObject)
 {
-	if (UJoinRoomAsync* Action = UJoinRoomAsync::JoinRandomRoom(WorldContextObject))
+	if (UFusionJoinRoomAsync* Action = UFusionJoinRoomAsync::JoinRandomRoom(WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -334,9 +337,9 @@ UJoinRoomAsync* UFusionOnlineSubsystem::JoinRandomRoom(UObject* WorldContextObje
 	return nullptr;
 }
 
-UConnectAndJoinRoomAsync* UFusionOnlineSubsystem::ConnectAndJoinRoom(const FFusionConnectOptions ConnectOptions, const FFusionRoomOptions RoomOptions, UObject* WorldContextObject)
+UFusionConnectAndJoinRoomAsync* UFusionOnlineSubsystem::ConnectAndJoinRoom(const FFusionConnectOptions ConnectOptions, const FFusionRoomOptions RoomOptions, UObject* WorldContextObject)
 {
-	if (UConnectAndJoinRoomAsync* Action = UConnectAndJoinRoomAsync::ConnectAndJoinRoom(ConnectOptions, RoomOptions, WorldContextObject))
+	if (UFusionConnectAndJoinRoomAsync* Action = UFusionConnectAndJoinRoomAsync::ConnectAndJoinRoom(ConnectOptions, RoomOptions, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -452,7 +455,7 @@ bool UFusionOnlineSubsystem::IsNetworked(const AActor* Actor)
 		{
 			if (SubSystem->GFusionClient)
 			{
-				if (const SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Actor))
+				if (const FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Actor))
 				{
 					return Obj != nullptr;
 				}
@@ -488,8 +491,7 @@ bool UFusionOnlineSubsystem::RegisterForecastCollision(UFusionPhysicsReplication
 {
 	if (FusionPhysicsReplicationComponent != nullptr && !IsOwner(FusionPhysicsReplicationComponent->GetOwner()))
 	{
-		if (FusionPhysicsReplication* Replication = FusionPhysicsUtils::GetReplication(
-			FusionPhysicsReplicationComponent->GetWorld()))
+		if (FusionPhysicsReplication* Replication = FusionPhysicsUtils::GetReplication(FusionPhysicsReplicationComponent->GetWorld()))
 		{
 			if (!Replication->RegisterCollision(FusionPhysicsReplicationComponent))
 			{
@@ -511,9 +513,9 @@ void UFusionOnlineSubsystem::SetPriority(const AActor* Actor, const int32 Priori
 		{
 			if (SubSystem->GFusionClient)
 			{
-				if (SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Actor))
+				if (FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Actor))
 				{
-					SubSystem->GFusionClient->GetClient()->SetSendRate(Obj, Priority);
+					SubSystem->GFusionClient->GetClient()->SetRoomSendRate(Obj, Priority);
 				}
 			}
 		}
@@ -546,7 +548,7 @@ bool UFusionOnlineSubsystem::HasOwner(const UObject* Object)
 			{
 				if (SubSystem->GFusionClient)
 				{
-					if (const SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
+					if (const FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
 					{
 						return SubSystem->GFusionClient->GetClient()->HasOwner(Obj);
 					}
@@ -569,7 +571,7 @@ int32 UFusionOnlineSubsystem::GetOwner(const UObject* Object)
 			{
 				if (SubSystem->GFusionClient)
 				{
-					if (const SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
+					if (const FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
 					{
 						return SubSystem->GFusionClient->GetClient()->GetOwner(Obj);
 					}
@@ -601,7 +603,7 @@ bool UFusionOnlineSubsystem::IsOwner(const UObject* Object)
 			{
 				if (SubSystem->GFusionClient)
 				{
-					if (const SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
+					if (const FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
 					{
 						return SubSystem->GFusionClient->GetClient()->IsOwner(Obj);
 					}
@@ -622,7 +624,7 @@ bool UFusionOnlineSubsystem::CanModify(const UObject* Object)
 		{
 			if (SubSystem->GFusionClient)
 			{
-				if (const SharedMode::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
+				if (const FusionCore::Object* Obj = SubSystem->GFusionClient->FindObject(Object))
 				{
 					return SubSystem->GFusionClient->GetClient()->CanModify(Obj);
 				}
@@ -720,51 +722,7 @@ bool UFusionOnlineSubsystem::CurrentRoomInfo(FString& Name, int32& Players) cons
 
 bool UFusionOnlineSubsystem::StartFusionSession()
 {
-	if (!RealtimeClient || !RealtimeClient->IsValid())
-	{
-		FUSION_LOG_ERROR("StartFusionSession: Invalid RealtimeClient");
-		return false;
-	}
-
-	if (!RealtimeClient->IsInRoom())
-	{
-		FUSION_LOG_ERROR("StartFusionSession: Client is not in a room");
-		return false;
-	}
-
-	if (GFusionClient)
-	{
-		FUSION_LOG_ERROR("StartFusionSession: Fusion is already running, call StopFusionSession first");
-		return false;
-	}
-
-	UWorld* World = GetGameInstance()->GetWorld();
-	if (!World)
-	{
-		FUSION_LOG_ERROR("StartFusionSession: Invalid World");
-		return false;
-	}
-
-	const UPhotonOnlineSubsystemSettings* Settings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
-	UFusionClient* FusionClient = NewObject<UFusionClient>();
-	FusionClient->Startup(World, GetTypeLookup(), Settings, *RealtimeClient->GetClient());
-	SetFusionClient(FusionClient);
-	FusionClient->ClientConnected();
-
-	return true;
-}
-
-bool UFusionOnlineSubsystem::StartFusionSession(UObject* WorldContextObject, TSoftObjectPtr<UWorld> InitialWorld)
-{
-	if (!StartFusionSession())
-		return false;
-
-	if (!InitialWorld.IsNull())
-	{
-		ChangeWorld(InitialWorld, WorldContextObject);
-	}
-
-	return true;
+	return FusionMatchmakingHelpers::StartFusion(GetWorld(), RealtimeClient);
 }
 
 void UFusionOnlineSubsystem::StopFusionSession()
@@ -790,9 +748,9 @@ void UFusionOnlineSubsystem::StopFusionSession(UObject* WorldContextObject, TSof
 	}
 }
 
-ULeaveRoomAsync* UFusionOnlineSubsystem::LeaveRoom(UObject* WorldContextObject)
+UFusionLeaveRoomAsync* UFusionOnlineSubsystem::LeaveRoom(UObject* WorldContextObject)
 {
-	if (ULeaveRoomAsync* Action = ULeaveRoomAsync::LeaveRoom(nullptr, WorldContextObject))
+	if (UFusionLeaveRoomAsync* Action = UFusionLeaveRoomAsync::LeaveRoom(nullptr, WorldContextObject))
 	{
 		Action->Activate();
 		return Action;
@@ -801,7 +759,7 @@ ULeaveRoomAsync* UFusionOnlineSubsystem::LeaveRoom(UObject* WorldContextObject)
 	return nullptr;
 }
 
-UTypeLookup* UFusionOnlineSubsystem::GetTypeLookup() const
+UFusionTypeLookup* UFusionOnlineSubsystem::GetTypeLookup() const
 {
 	return Lookup;
 }
@@ -846,25 +804,6 @@ void UFusionOnlineSubsystem::OnMapDestroy(UWorld* LoadedWorld)
 	if (bRunUnderOneProcess && !UFusionHelpers::IsAllowedWorldInstance(GFusionClient, LoadedWorld))
 		return;
 
-	// Remove actor spawn/destroy handlers from the world being torn down
-	if (LoadedWorld)
-	{
-		if (OnActorSpawnedHandle.IsValid())
-		{
-			LoadedWorld->RemoveOnActorSpawnedHandler(OnActorSpawnedHandle);
-			OnActorSpawnedHandle.Reset();
-		}
-		if (OnActorDestroyedHandle.IsValid())
-		{
-#if UE_VERSION_OLDER_THAN(5, 5, 0)
-			LoadedWorld->RemoveOnActorDestroyededHandler(OnActorDestroyedHandle);
-#else
-			LoadedWorld->RemoveOnActorDestroyedHandler(OnActorDestroyedHandle);
-#endif
-			OnActorDestroyedHandle.Reset();
-		}
-	}
-
 	GFusionClient->OnMapDestroy(LoadedWorld);
 }
 
@@ -887,34 +826,8 @@ void UFusionOnlineSubsystem::OnMapInit(UWorld* LoadedWorld, UWorld::Initializati
 	{
 		return;
 	}
-	
-	OnActorSpawnedHandle = LoadedWorld->AddOnActorSpawnedHandler(FOnActorSpawned::FDelegate::CreateUObject(this, &UFusionOnlineSubsystem::OnActorSpawned));
-	OnActorDestroyedHandle = LoadedWorld->AddOnActorDestroyedHandler(FOnActorSpawned::FDelegate::CreateUObject(this, &UFusionOnlineSubsystem::OnActorDestroyed));
-	
+
 	GFusionClient->OnMapInit(LoadedWorld);
-}
-
-void UFusionOnlineSubsystem::OnActorSpawned(AActor* SpawnedActor)
-{
-	if (!GFusionClient)
-		return;
-
-	if (!IsConnected())
-		return;
-
-	GFusionClient->OnActorSpawned(SpawnedActor);
-}
-
-// ReSharper disable once CppParameterMayBeConstPtrOrRef
-void UFusionOnlineSubsystem::OnActorDestroyed(AActor* DestroyedActor)
-{
-	if (!GFusionClient)
-		return;
-
-	if (!IsConnected())
-		return;
-
-	GFusionClient->OnEngineObjectDestroyed(DestroyedActor, true);
 }
 
 void UFusionOnlineSubsystem::OnPreMapLoad(const FWorldContext& Context, const FString& WorldName)
@@ -947,4 +860,34 @@ void UFusionOnlineSubsystem::OnPostMapLoad(UWorld* LoadedWorld)
 		return;
 	
 	GFusionClient->PostMapLoad(LoadedWorld);
+}
+
+void UFusionOnlineSubsystem::OnLevelAdded(ULevel* Level, UWorld* World)
+{
+	if (!GFusionClient)
+		return;
+
+	//When under one process all maps are under the engine and we need to figure out which world goes with which fusion client.
+	if (bRunUnderOneProcess && !UFusionHelpers::IsAllowedWorldInstance(GFusionClient, World))
+		return;
+
+	if (!IsConnected())
+		return;
+
+	GFusionClient->OnLevelAdded(Level, World);
+}
+
+void UFusionOnlineSubsystem::OnLevelRemoved(ULevel* Level, UWorld* World)
+{
+	if (!GFusionClient)
+		return;
+
+	//When under one process all maps are under the engine and we need to figure out which world goes with which fusion client.
+	if (bRunUnderOneProcess && !UFusionHelpers::IsAllowedWorldInstance(GFusionClient, World))
+		return;
+
+	if (!IsConnected())
+		return;
+
+	GFusionClient->OnLevelRemoved(Level, World);
 }

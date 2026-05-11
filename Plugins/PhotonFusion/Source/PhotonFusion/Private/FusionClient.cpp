@@ -3,17 +3,21 @@
 
 #include "FusionClient.h"
 #include "FusionCVars.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
 #include <codecvt>
+#include <Fusion/FusionRoomProperties.h>
 
 #include "Misc/AssertionMacros.h"
+#include "Misc/EngineVersionComparison.h"
 #include "EngineUtils.h"
 #include "FusionActorComponent.h"
 #include "FusionHelpers.h"
 #include "Physics/FusionPhysicsReplicationComponent.h"
 #include "FusionUtils.h"
 #include "Physics/FusionPhysicsUtils.h"
-#include "PhotonOnlineSubsystemSettings.h"
+#include "FusionOnlineSubsystemSettings.h"
+#include "FusionRealtimeClient.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -33,11 +37,12 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/IConsoleManager.h"
-#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Types/FusionNetworkedArrayBuilder.h"
 #include "Engine/GameEngine.h"
 #include "Engine/NetDriver.h"
-#include "Types/TypeLookup.h"
+#include "GameFramework/GameMode.h"
+#include "Types/FusionTypeLookup.h"
+#include "Engine/LevelStreaming.h"
 
 #if WITH_EDITOR
 #include "Settings/LevelEditorPlaySettings.h"
@@ -45,54 +50,75 @@
 
 // ReSharper restore CppUnusedIncludeDirective
 
+// Photon Fusion is the actual transport, not UE replication. UE's level-streaming
+// visibility transactions wait on a server ack that never arrives, hanging the
+// MakingInvisible/MakingVisible transitions. These flags tell the engine to skip
+// the transaction request — they're protected on ULevelStreaming, so we elevate
+// access via a derived struct (no new members → safe static_cast).
+struct FFusionLevelStreamingAccess : public ULevelStreaming
+{
+	using ULevelStreaming::bSkipClientUseMakingInvisibleTransactionRequest;
+	using ULevelStreaming::bSkipClientUseMakingVisibleTransactionRequest;
+};
+
+static void ApplyFusionStreamingSkipFlags(UWorld* World)
+{
+	if (!World)
+	{
+		return;
+	}
+	
+	for (ULevelStreaming* Streaming : World->GetStreamingLevels())
+	{
+		if (!Streaming)
+		{
+			continue;
+		}
+		auto* Access = static_cast<FFusionLevelStreamingAccess*>(Streaming);
+		Access->bSkipClientUseMakingInvisibleTransactionRequest = 1;
+		Access->bSkipClientUseMakingVisibleTransactionRequest   = 1;
+	}
+}
+
 
 FKeyObjectId::operator uint64() const
 {
 	return static_cast<uint64>(Origin) | static_cast<uint64>(Counter) << 32;
 }
 
-static EFusionObjectDestroyMode ToUnrealDestroyMode(SharedMode::DestroyModes Mode)
+static EFusionObjectDestroyMode ToUnrealDestroyMode(FusionCore::DestroyModes Mode)
 {
 	switch (Mode)
 	{
-	case SharedMode::DestroyModes::Local:            return EFusionObjectDestroyMode::Local;
-	case SharedMode::DestroyModes::Remote:           return EFusionObjectDestroyMode::Remote;
-	case SharedMode::DestroyModes::SceneChange:      return EFusionObjectDestroyMode::SceneChange;
-	case SharedMode::DestroyModes::Shutdown:          return EFusionObjectDestroyMode::Shutdown;
-	case SharedMode::DestroyModes::RejectedNotOwner: return EFusionObjectDestroyMode::RejectedNotOwner;
-	case SharedMode::DestroyModes::ForceDestroy:     return EFusionObjectDestroyMode::ForceDestroy;
+	case FusionCore::DestroyModes::Local:            return EFusionObjectDestroyMode::Local;
+	case FusionCore::DestroyModes::Remote:           return EFusionObjectDestroyMode::Remote;
+	case FusionCore::DestroyModes::MapChange:        return EFusionObjectDestroyMode::MapChange;
+	case FusionCore::DestroyModes::Shutdown:          return EFusionObjectDestroyMode::Shutdown;
+	case FusionCore::DestroyModes::RejectedNotOwner: return EFusionObjectDestroyMode::RejectedNotOwner;
+	case FusionCore::DestroyModes::ForceDestroy:     return EFusionObjectDestroyMode::ForceDestroy;
 	default:                                         return EFusionObjectDestroyMode::Local;
 	}
 }
 
 void UFusionClient::AttachCurrentMap(UWorld* World)
 {
-	if (Client->IsMasterClient())
-	{
-		TriggerLevelChanged(World->GetName(), true);
+	if (!Client->IsMasterClient())
+		return;
+	
+	TriggerLevelChanged(World->GetName(), true);
 		
-		//Assume masterclient can directly connect all things in the active world.
-		AttachCurrentMap_Internal(World);
-	}
-	else
-	{
-		//Wait for current map state to change before we can attach none master clients.
-		if (CurrentMapInstance.bAttachCurrent && World->GetName() == CurrentMapInstance.Name)
-		{
-			//Connecting clients have to wait for OnSceneChange to populate current world settings before connecting objects.
-			AttachCurrentMap_Internal(World);
-		}
-	}
+	//Assume masterclient can directly connect all things in the active world.
+	AttachCurrentMap_Internal(World);
 }
 
 void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 {
 	if (CurrentWorld.IsValid())
 	{
-		TArray<SharedMode::ObjectId> PairsToRemove;
+		TArray<FusionCore::ObjectId> PairsToRemove;
 		for (auto Pair : ObjectIdToPair)
 		{
-			SharedMode::Object* Object = Client->FindObject(Pair.Key);
+			FusionCore::Object* Object = Client->FindObject(Pair.Key);
 
 			if (!Object)
 			{
@@ -100,7 +126,7 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 				continue;
 			}
 			
-			if (Object && (Object->SpecialFlags & SharedMode::ObjectSpecialFlags::ExistsOnClient) != SharedMode::ObjectSpecialFlags::None)
+			if (Object && (Object->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient)) != 0)
 			{
 				continue;
 			}
@@ -125,10 +151,13 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 			}
 		}
 	}
-		
-	OnMapDestroy(CurrentWorld.Get());
 
 	//Destroy any remote proxy objects incase this is called multiple times.
+	
+	OnMapDestroy(CurrentWorld.Get());
+
+	OnMapInit(World);
+
 	CurrentWorld = World;
 
 	if (CurrentWorld.IsValid())
@@ -142,7 +171,7 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 			{
 				RemoveObjectRoot(RootObject);
 
-				if (RootObject && (RootObject->SpecialFlags & SharedMode::ObjectSpecialFlags::ExistsOnClient) == SharedMode::ObjectSpecialFlags::None)
+				if (RootObject && (RootObject->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient)) == 0)
 				{
 					//Destroys any player owned objects that are not part of client init (map actors and GameInstance)
 					Client->DestroyObjectLocal(RootObject, true);
@@ -151,7 +180,7 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 		}
 		
 		UObject* GameInstance = UGameplayStatics::GetGameInstance(CurrentWorld.Get());
-		AttachGlobalInstanceActor(GameInstance);
+		AttachGlobalInstanceActor(nullptr, 0, GameInstance);
 
 		// First, connect any existing remote network objects to actors in the current world.
 		// These are objects that were spawned on remote clients before this map was attached.
@@ -175,6 +204,18 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 				
 				Source->Ownership = EFusionObjectOwnerFlags::PlayerAttached;
 			}
+
+			if (Actor->IsA(AGameStateBase::StaticClass()))
+			{
+				if (!Source)
+				{
+					Source = NewObject<UFusionActorComponent>(Actor);
+					Source->bSkipAutoAttach = true;
+					Source->RegisterComponent();
+				}
+				
+				Source->Ownership = EFusionObjectOwnerFlags::MasterClient;
+			}
 			
 			if (!Source)
 				continue;
@@ -197,7 +238,7 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 		//Create all remote objects including already existing map objects.
 		for (auto& [ObjectId, RootObject] : Client->AllRootObjects())
 		{
-			if (RootObject && (RootObject->SpecialFlags & SharedMode::ObjectSpecialFlags::SceneObject) != SharedMode::ObjectSpecialFlags::None)
+			if (RootObject && (RootObject->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::SceneObject)) != 0)
 			{
 				if (UnboundMapActors.Contains(ObjectId.Counter))
 				{
@@ -218,13 +259,13 @@ void UFusionClient::AttachCurrentMap_Internal(UWorld* World)
 				
 				OnObjectCreatedFinalize(RootObject);
 
-				for (auto SubObjectId : RootObject->SubObjects)
+				for (auto SubObjectId : RootObject->GetSubObjects())
 				{
-					FObjectActorPair SubObjectPair = FindObjectPair(SubObjectId);
+					FFusionObjectActorPair SubObjectPair = FindObjectPair(SubObjectId);
 					if (SubObjectPair.IsValid()) //Check if we already have this connected
 						continue;
 
-					SharedMode::Object* SubObject = Client->FindObject(SubObjectId);
+					FusionCore::Object* SubObject = Client->FindObject(SubObjectId);
 					OnObjectCreatedFinalize(SubObject);
 				}
 			}
@@ -254,17 +295,20 @@ void UFusionClient::ClientConnected()
 	SetMapState(EMapState::LevelActive);
 }
 
-void UFusionClient::SendUserRpc(const int64 Id, const SharedMode::PlayerId Player, const AActor* Actor, const char* Data, SIZE_T DataLength)
+void UFusionClient::SendUserRpc(const int64 Id, const  FusionCore::PlayerId Player, const AActor* Actor, const char* Data, SIZE_T DataLength)
 {
+	auto RPC = Client->CreateUserRpc(Id, Player, FusionCore::ObjectId{}, 0, Data, DataLength);
+	
 	if (Actor == nullptr)
 	{
-		Client->SendUserRpc(Client->CreateUserRpc(Id, Player, SharedMode::ObjectId{}, 0, 0, Data, DataLength));
+		
+		Client->SendUserRpc(RPC);
 	}
 	else
 	{
-		if (const SharedMode::Object* Obj = FindObject(Actor))
+		if (const FusionCore::Object* Obj = FindObject(Actor))
 		{
-			Client->SendUserRpc(Client->CreateUserRpc(Id, Player, Obj->Id, 0, 0, Data, DataLength));
+			Client->SendUserRpc(RPC);
 		}
 		else
 		{
@@ -276,39 +320,39 @@ void UFusionClient::SendUserRpc(const int64 Id, const SharedMode::PlayerId Playe
 void UFusionClient::SendCustomRPC(const UObject* Source, const FString& EventName, const uint64 RPCId, const EFusionRPCTarget Target, const TArray<uint8>& Buffer, const ERPCMode RPCMode)
 {
 	//Ensure that the backing event is mapped on a descriptor.
-	if (const UTypeDescriptor* Descriptor = Lookup->FindClassDescriptor(Source->GetClass()); Descriptor && Descriptor->EventFunctions.Contains(EventName))
+	if (const UFusionTypeDescriptor* Descriptor = Lookup->FindClassDescriptor(Source->GetClass()); Descriptor && Descriptor->EventFunctions.Contains(EventName))
 	{
-		if (const SharedMode::ObjectId ObjectId = FindObjectId(Source); ObjectId.IsSome())
+		if (const FusionCore::ObjectId ObjectId = FindObjectId(Source); ObjectId.IsSome())
 		{
 			//So we can find the actual event when receiving the rpc.
 			const uint64 EventHash = Descriptor->EventNameToHash[EventName];
 
-			SharedMode::PlayerId TargetPlayer;
+			FusionCore::PlayerId TargetPlayer;
 			if (Target == EFusionRPCTarget::SendToMasterClient)
 			{
-				TargetPlayer = SharedMode::MasterClientPlayerId;
+				TargetPlayer = FusionCore::MasterClientPlayerId;
 			}
 			else if (Target == EFusionRPCTarget::SendToObjectOwner)
 			{
-				TargetPlayer = SharedMode::ObjectOwnerPlayerId;
+				TargetPlayer = FusionCore::ObjectOwnerPlayerId;
 			}
 			else
 			{
 				//What do we use to donate no specific player as target and just for all clients?
-				TargetPlayer = SharedMode::PlayerId{};
+				TargetPlayer = FusionCore::PlayerId{};
 
 				//Immediate dispatch to self, since everyone is target, (perhaps with small artificial delay to not make local stuff to snappy...)
 			}
 
-			const SharedMode::Object* EngineObject = FindObject(Source);
+			const FusionCore::Object* EngineObject = FindObject(Source);
 
 			//Reason why we are sending an Int64 is because it's passed from potential Blueprint source and
-			const SharedMode::Rpc Rpc = Client->CreateUserRpc(RPCId, TargetPlayer, ObjectId, Descriptor->TypeHash,
+			FusionCore::Rpc Rpc = Client->CreateUserRpc(RPCId, TargetPlayer, ObjectId,
 			                                                  EventHash,
 			                                                  reinterpret_cast<const char*>(Buffer.GetData()),
 			                                                  Buffer.Num());
 			
-			//UE_LOG(LogTemp, Warning, TEXT("Sending RPC id: %llu  ClientId: %s"), Rpc.Id, *ClientInstanceId.ToString());
+			//UE_LOG(LogFusion, Warning, TEXT("Sending RPC id: %llu  ClientId: %s"), Rpc.Id, *ClientInstanceId.ToString());
 			
 			if (RPCMode == ERPCMode::FusionRPC)
 			{
@@ -338,9 +382,9 @@ void UFusionClient::SendCustomRPC(const UObject* Source, const FString& EventNam
 			}
 			else if (RPCMode == ERPCMode::UnrealRPC)
 			{
-				bool TargetMasterClient = TargetPlayer == SharedMode::MasterClientPlayerId;
-				bool TargetOwner = TargetPlayer == SharedMode::ObjectOwnerPlayerId;
-				bool TargetPlugin = TargetPlayer == SharedMode::PluginPlayerId;
+				bool TargetMasterClient = TargetPlayer == FusionCore::MasterClientPlayerId;
+				bool TargetOwner = TargetPlayer == FusionCore::ObjectOwnerPlayerId;
+				bool TargetPlugin = TargetPlayer == FusionCore::PluginPlayerId;
 				
 				if (TargetMasterClient || TargetOwner || TargetPlugin)
 				{
@@ -360,7 +404,7 @@ UFusionClient::~UFusionClient()
 	delete Client;
 }
 
-FObjectActorPair UFusionClient::RegisterObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, SharedMode::Object* FusionObject, EObjectPairType Type)
+FFusionObjectActorPair UFusionClient::RegisterObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, FusionCore::Object* FusionObject, EFusionObjectPairType Type)
 {
 	if (Object == nullptr)
 	{
@@ -387,22 +431,26 @@ FObjectActorPair UFusionClient::RegisterObject(UFusionActorComponent* Source, AA
 	// not keep the object alive from GC pov.
 	FusionObject->Engine = Object;
 
-	FObjectActorPair Pair = FObjectActorPair{Type, OwningActor, Object, Source, FusionObject, FusionObject->Id };
+	FFusionObjectActorPair Pair = FFusionObjectActorPair{Type, OwningActor, Object, Source, FusionObject, FusionObject->Id };
 
 	// Build property state mapping from type descriptor
-	if (const TStrongObjectPtr<UTypeDescriptor>* DescPtr = Lookup->HashToDescriptor.Find(FusionObject->Type.Hash))
+	if (const TStrongObjectPtr<UFusionTypeDescriptor>* DescPtr = Lookup->HashToDescriptor.Find(FusionObject->Type.Hash))
 	{
 		if (DescPtr->IsValid())
 		{
-			const UTypeDescriptor* Desc = DescPtr->Get();
+			const UFusionTypeDescriptor* Desc = DescPtr->Get();
 			Pair.PropertyStates.Reserve(Desc->Properties.Num());
-			for (const Property* Prop : Desc->Properties)
+			for (Property* Prop : Desc->Properties)
 			{
-				Pair.PropertyStates.Add({Prop->EngineProperty, Prop->WordOffset, Prop->WordCount});
+				Prop->BuildState(Pair.PropertyStates);
 			}
 		}
 	}
 
+	if (ObjectIdToPair.Contains(FusionObject->Id))
+	{
+		FUSION_LOG("duplicate2");
+	}
 	// mapping for id => actor+obj pair, this has
 	// to be kept like this so that unreals garbage collector see it
 	ObjectIdToPair.Add(FusionObject->Id, Pair);
@@ -421,7 +469,7 @@ FObjectActorPair UFusionClient::RegisterObject(UFusionActorComponent* Source, AA
 	return Pair;
 }
 
-FObjectActorPair UFusionClient::RegisterRuntimeObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, SharedMode::Object* FusionObject, EObjectPairType Type)
+FFusionObjectActorPair UFusionClient::RegisterRuntimeObject(UFusionActorComponent* Source, AActor* OwningActor, UObject* Object, FusionCore::Object* FusionObject, EFusionObjectPairType Type)
 {
 	if (Object == nullptr)
 	{
@@ -435,9 +483,9 @@ FObjectActorPair UFusionClient::RegisterRuntimeObject(UFusionActorComponent* Sou
 		return {};
 	}
 
-	FPropertyBuildOptions BuildOptions = UTypeLookup::GetDefaultBuildOptions();
+	FPropertyBuildOptions BuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
 	
-	const UTypeDescriptor* Desc = Lookup->CreateTypeDescriptor(Object->GetClass(), BuildOptions);
+	const UFusionTypeDescriptor* Desc = Lookup->CreateTypeDescriptor(Object->GetClass(), BuildOptions);
 
 	//
 	FUSION_LOG("Shared Mode Object Registered %s (%s) [hash/id: %llu]", *ObjectIdToString(FusionObject->Id), *Object->GetName(), Desc->TypeHash);
@@ -449,15 +497,15 @@ FObjectActorPair UFusionClient::RegisterRuntimeObject(UFusionActorComponent* Sou
 	// mapping of AActor* to object Id
 	TempObjectToObjectId.Add(Object, FusionObject->Id);
 
-	FObjectActorPair Pair = FObjectActorPair{ Type, OwningActor, Object, Source, FusionObject, FusionObject->Id };
+	FFusionObjectActorPair Pair = FFusionObjectActorPair{ Type, OwningActor, Object, Source, FusionObject, FusionObject->Id };
 
 	// Build property state mapping from type descriptor
 	Pair.PropertyStates.Reserve(Desc->Properties.Num());
-	for (const Property* Prop : Desc->Properties)
+	for (Property* Prop : Desc->Properties)
 	{
-		Pair.PropertyStates.Add({Prop->EngineProperty, Prop->WordOffset, Prop->WordCount});
+		Prop->BuildState(Pair.PropertyStates);
 	}
-
+	
 	// mapping for id => actor+obj pair, this has
 	// to be kept like this so that unreals garbage collector see it
 	TempObjectIdToPair.Add(FusionObject->Id, Pair);
@@ -486,7 +534,7 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 	
 	if (DestroyedMapActors.Contains(MapSequence))
 	{
-		FKeyObjectId MapActorId(0, MapActorHash);
+		FKeyObjectId MapActorId(0, MapSequence, MapActorHash);
 		//Check if map actor is in the destroyed list.
 		if (DestroyedMapActors[MapSequence].Contains(MapActorId))
 		{
@@ -512,33 +560,33 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 	}
 
 	TArray<FTypeData> TypesData{};
-	SharedMode::ObjectOwnerModes OwnerMode = Source->GetTypes(this, Components, Owner->GetRootComponent(), TypesData);
+	FusionCore::ObjectOwnerModes OwnerMode = Source->GetTypes(this, Components, Owner->GetRootComponent(), TypesData);
 
 	uint64 WordCount = 0;
 	for (FTypeData Item : TypesData)
 		WordCount += Item.TypeRef.WordCount;
 	
 	FTypeData BaseTypeData = TypesData[0];
+	
 	const int32 SubObjectCount = TypesData.Num() - 1;
+	FUSION_LOG("Attempt To Attach Map Actor: %s Index: %d, Map: %d, words %llu",  *Source->GetOwner()->GetName(), MapActorHash, MapSequence, WordCount);
 	
-	FUSION_LOG("Attempt To Attach Map Actor: %s Index: %d, Scene: %d, words %llu",  *Source->GetOwner()->GetName(), MapActorHash, MapSequence, WordCount);
+	uint32_t MapObjectFlags = static_cast<uint32_t>(EObjectSpecialFlags::SceneObject) | static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient);
 	
-	SharedMode::ObjectSpecialFlags SceneObjectFlags = SharedMode::ObjectSpecialFlags::SceneObject | SharedMode::ObjectSpecialFlags::ExistsOnClient;
-	
-	bool bExisting{false};
-	if (SharedMode::ObjectRoot* Obj = Client->CreateSceneObject(bExisting, BaseTypeData.TypeRef.WordCount, BaseTypeData.TypeRef, nullptr, 0, MapSequence, MapActorHash, OwnerMode, SceneObjectFlags, SubObjectCount))
+	bool bExisting{false};	
+	if (FusionCore::ObjectRoot* Obj = Client->CreateMapObject(bExisting, BaseTypeData.TypeRef.WordCount, BaseTypeData.TypeRef, nullptr, 0, MapSequence, MapActorHash, OwnerMode, MapObjectFlags, SubObjectCount))
 	{
 		Obj->SetSendUpdates(SendUpdates);
 		
 		Source->SubscribeEvents(Client, Obj->Id);
 		
 		AActor* Actor = Cast<AActor>(BaseTypeData.Object.Get());
-		FObjectActorPair Pair = RegisterObject(Source, Actor, BaseTypeData.Object.Get(), Obj, EObjectPairType::Actor);
+		FFusionObjectActorPair Pair = RegisterObject(Source, Actor, BaseTypeData.Object.Get(), Obj, EFusionObjectPairType::Actor);
 
 		PhotonCommon::StringType ObjectIdString = Obj->Id;
-		FUSION_LOG("Created Object Id: %s   Scene: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->Scene, Obj->Words.Length, *BaseTypeData.Object->GetName());
+		FUSION_LOG("Created Object Id: %s   Map: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->GetMap(), Obj->Words.Length, *BaseTypeData.Object->GetName());
 
-		SharedMode::ObjectId* RequiredObjects = Obj->RequiredObjects();
+		auto RequiredObjects = Obj->RequiredObjects();
 		int32 RequiredObjectIndex = 0;
 
 		//iterate subobjects
@@ -549,7 +597,7 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 
 			const uint32 SubObjectHash = UFusionHelpers::SafeObjectNameHash(SubObjectTypeData.Object.Get());
 
-			if (TStrongObjectPtr<UTypeDescriptor> Descriptor = Lookup->HashToDescriptor.FindRef(SubObjectTypeData.TypeRef.Hash))
+			if (TStrongObjectPtr<UFusionTypeDescriptor> Descriptor = Lookup->HashToDescriptor.FindRef(SubObjectTypeData.TypeRef.Hash))
 			{
 				FString const SubObjectClassPath = Descriptor->Type.Get()->GetPathName();
 
@@ -560,15 +608,16 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 				//Similar to parent container object we check if the subobjects just needs to get registered or created.
 				//We dont register mapactors or their subobjects in the OnObjectCreatedFinalize.
 				//This could potentially run in paralell with a remote scene object being created on the client.
-				SharedMode::Object* ExistingSubObject = Client->FindSubObjectWithHash(Obj, SubObjectHash);
+				FusionCore::Object* ExistingSubObject = Client->FindSubObjectWithHash(Obj, SubObjectHash);
 
 				if (!ExistingSubObject)
 				{
-					SharedMode::ObjectId SubObjectId{ MapActorHash, SubObjectHash};
+					SharedMode::PlayerId MapObjectId = static_cast<SharedMode::PlayerId>((MapActorHash >> 16) ^ (MapActorHash & 0xFFFF));
+					SharedMode::ObjectId SubObjectId{ MapObjectId, Obj->GetMap(), SubObjectHash};
 
-					SharedMode::ObjectSpecialFlags SubObjectFlags = SceneObjectFlags | SubObjectTypeData.SpecialFlags;
+					uint32_t SubObjectFlags = MapObjectFlags | static_cast<uint32_t>(SubObjectTypeData.SpecialFlags);
 					
-					SharedMode::ObjectChild* SubObject = Client->CreateSubObject(Obj->Id,
+					FusionCore::ObjectChild* SubObject = Client->CreateSubObject(Obj->Id,
 														 SubObjectTypeData.TypeRef.WordCount,
 														 SubObjectTypeData.TypeRef,
 														 reinterpret_cast<const PhotonCommon::CharType*>(SubObjectTypesJsonUTF8.Get()),
@@ -579,12 +628,12 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 
 					if (Client->AddSubObject(Obj, SubObject))
 					{
-						if (RequiredObjects && RequiredObjectIndex < SubObjectCount)
+						if (!RequiredObjects.empty() && RequiredObjectIndex < SubObjectCount)
 						{
 							RequiredObjects[RequiredObjectIndex++] = SubObject->Id;
 						}
 
-						FObjectActorPair SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), SubObject, EObjectPairType::Component);
+						FFusionObjectActorPair SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), SubObject, EFusionObjectPairType::Component);
 						CopyLocalStateToObject(SubObjectPair);
 
 						PhotonCommon::StringType SubObjectIdString = SubObject->Id;
@@ -599,7 +648,7 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 				else
 				{
 					//Remote update already came in for object, we just need to update our registers.
-					FObjectActorPair SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), ExistingSubObject, EObjectPairType::Component);
+					FFusionObjectActorPair SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), ExistingSubObject, EFusionObjectPairType::Component);
 					
 					FCopyContext SubObjectContext
 					{
@@ -636,28 +685,67 @@ void UFusionClient::AttachMapActor(UFusionActorComponent* Source, const uint32 M
 	}
 }
 
-void UFusionClient::AttachGlobalInstanceActor(UObject* Object)
+void UFusionClient::AttachGlobalInstanceActor(UFusionActorComponent* Source, const uint32 MapSequence, UObject* Object)
 {
-	constexpr SharedMode::ObjectOwnerModes OwnerMode = SharedMode::ObjectOwnerModes::GameGlobal;
+	constexpr FusionCore::ObjectOwnerModes OwnerMode = FusionCore::ObjectOwnerModes::GameGlobal;
+	TArray<FTypeData> TypesData{};
 	
-	FPropertyBuildOptions BuildOptions = UTypeLookup::GetDefaultBuildOptions();
-	const UTypeDescriptor* TypeDescriptor = Lookup->CreateTypeDescriptor(Object->GetClass(), BuildOptions);
-	const SharedMode::TypeRef TypeRef = SharedMode::TypeRef{TypeDescriptor->TypeHash, TypeDescriptor->WordCount};
+	if (Source)
+	{
+		AActor* Owner = Source->GetOwner();
 
-	//Should produce same id on all clients since game instance will not change at runtime.
-	// const TStringPointer<char> Name = StringCast<char>(*Object->GetClass()->GetName());
-	// const unsigned int Index = Crc32(reinterpret_cast<const unsigned char*>(Name.Get()), strlen(Name.Get()));
+		//Get actual runtime components but only those that exist in the CDO (class-defined).
+		//The runtime added components are processed elsewhere.
+		//CDO-defined components should be deterministic for all clients loading the map.
+		TSet<UActorComponent*> Components;                                                                                                                                                                                                                                                                                                                                                                                           
+		for (UActorComponent* Component : Owner->GetComponents())                                                                                                                                                                                                                                                                                                                                              
+		{
+			if (Component->CreationMethod == EComponentCreationMethod::Native ||
+				Component->CreationMethod == EComponentCreationMethod::SimpleConstructionScript)
+			{
+				Components.Add(Component);
+			}
+		}
+		
+		Source->GetTypes(this, Components, Owner->GetRootComponent(), TypesData);
+	}
+	else
+	{
+		FPropertyBuildOptions BuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
+		const UFusionTypeDescriptor* TypeDescriptor = Lookup->CreateTypeDescriptor(Object->GetClass(), BuildOptions);
+		const FusionCore::TypeRef TypeRef = FusionCore::TypeRef{TypeDescriptor->TypeHash, TypeDescriptor->WordCount};
+		
+		const FTypeData TypeData {
+			TypeRef,
+			Object
+		};
+		TypesData.Add(TypeData);
+	}
+	
+	//Condense the spawned actor into json
+	FString TypesJson = UFusionHelpers::GetTypesHeader(this, TypesData);
+	const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> TypesJsonUTF8 = StringCast<UTF8CHAR>(*TypesJson);
 
+	//Assume only 1 object of this class can exists on each client.
 	FString Name = *Object->GetClass()->GetName();
 	const uint32 Hash = UFusionHelpers::SafeObjectNameHash(TCHAR_TO_ANSI(*Name), Name.Len());
 
 	bool bExisting{false};
 
-	SharedMode::ObjectSpecialFlags Flags = SharedMode::ObjectSpecialFlags::ExistsOnClient;
+	//This way we dont create this again on all other clients, assume they make their locally and we just apply whatever state is needed.
+	uint32_t Flags = static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient);
+
+	FTypeData BaseTypeData = TypesData[0];
 	
-	if (auto* Obj = Client->CreateGlobalInstanceObject(bExisting, TypeRef.WordCount, TypeRef, nullptr, 0, 0, Hash, OwnerMode, Flags))
+	if (auto* Obj = Client->CreateGlobalInstanceObject(bExisting, BaseTypeData.TypeRef.WordCount, BaseTypeData.TypeRef,
+										reinterpret_cast<const PhotonCommon::CharType*>(TypesJsonUTF8.Get()),
+										TypesJsonUTF8.Length(),
+										MapSequence,
+										Hash,
+										OwnerMode,
+										Flags))
 	{
-		FObjectActorPair ObjectPair = RegisterObject(nullptr, nullptr, Object, Obj, EObjectPairType::GlobalInstance);
+		FFusionObjectActorPair ObjectPair = RegisterObject(Source, nullptr, Object, Obj, EFusionObjectPairType::GlobalInstance);
 		if (bExisting)
 		{
 			FCopyContext Context
@@ -674,7 +762,7 @@ void UFusionClient::AttachGlobalInstanceActor(UObject* Object)
 		}
 
 		const PhotonCommon::StringType ObjectIdString = Obj->Id;
-		FUSION_LOG("Created Global Instance Object Id: %s  Scene: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->Scene, Obj->Words.Length, *Object->GetName());
+		FUSION_LOG("Created Global Instance Object Id: %s  Map: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->GetMap(), Obj->Words.Length, *Object->GetName());
 	}
 }
 
@@ -683,13 +771,13 @@ void UFusionClient::AttachSpawnedActor(UFusionActorComponent* Source, const uint
 	AActor* Owner = Source->GetOwner();
 		
 	TArray<FTypeData> TypesData{};
-	SharedMode::ObjectOwnerModes OwnerMode = Source->GetTypes(this, Owner->GetComponents(), Owner->GetRootComponent(), TypesData);
+	FusionCore::ObjectOwnerModes OwnerMode = Source->GetTypes(this, Owner->GetComponents(), Owner->GetRootComponent(), TypesData);
 
 	uint64 WordCount = 0;
 	for (FTypeData Item : TypesData)
 		WordCount += Item.TypeRef.WordCount;
 	
-	FUSION_LOG("Attempt To Attach Spawned Actor: %s  Scene: %d, words %llu", *Source->GetOwner()->GetName(), Scene, WordCount);
+	FUSION_LOG("Attempt To Attach Spawned Actor: %s  Map: %d, words %llu", *Source->GetOwner()->GetName(), Scene, WordCount);
 
 	//Condense the spawned actor into json
 	FString TypesJson = UFusionHelpers::GetTypesHeader(this, TypesData);
@@ -699,38 +787,46 @@ void UFusionClient::AttachSpawnedActor(UFusionActorComponent* Source, const uint
 
 	const int32 SubObjectCount = TypesData.Num() - 1;
 
-	SharedMode::ObjectId PreconfiguredId;
+	FusionCore::ObjectId PreconfiguredId;
 	uint32 ActiveScene = Scene;
 	if (Owner->IsA<APlayerState>())
 	{
-		if (SharedMode::ObjectRoot* Existing = Client->FindObjectRoot(CurrentPlayerStateId))
+		if (FusionCore::ObjectRoot* Existing = Client->FindObjectRoot(CurrentPlayerStateId))
 		{
 			//Since player states have a fixed hash we must sure only 1 exists per player between map changes, it will not manually destroy itself.
 			Client->DestroyObjectLocal(Existing, true);
 			RemoveObjectRoot(Existing);
 		}
 		
-		PreconfiguredId = Client->GetNewObjectId();
+		PreconfiguredId = Client->GetNewObjectId(0);
 		ActiveScene = 0;
 		CurrentPlayerStateId = PreconfiguredId;
 	}
+	else if (Owner->IsA(AGameStateBase::StaticClass()))
+	{
+		AttachGlobalInstanceActor(Source, Scene, Owner);
+		return;
+	}
 	
-	if (SharedMode::ObjectRoot* Obj = Client->CreateObject(BaseTypeData.TypeRef.WordCount, BaseTypeData.TypeRef,
+
+	uint32_t EngineObjectFlags = static_cast<uint32_t>(Source->FusionObjectFlags);
+	
+	if (FusionCore::ObjectRoot* Obj = Client->CreateObject(BaseTypeData.TypeRef.WordCount, BaseTypeData.TypeRef,
 														   reinterpret_cast<const PhotonCommon::CharType*>(TypesJsonUTF8.Get()), TypesJsonUTF8.Length(),
-														   ActiveScene, OwnerMode, Source->FusionObjectFlags, SubObjectCount, PreconfiguredId))
+														   ActiveScene, OwnerMode, EngineObjectFlags, SubObjectCount, PreconfiguredId))
 	{
 		Obj->SetSendUpdates(SendUpdates);
 		
 		Source->SubscribeEvents(Client, Obj->Id);
 
 		AActor* Actor = Cast<AActor>(BaseTypeData.Object.Get());
-		FObjectActorPair ObjectPair = RegisterObject(Source, Actor, BaseTypeData.Object.Get(), Obj, EObjectPairType::Actor);
+		FFusionObjectActorPair ObjectPair = RegisterObject(Source, Actor, BaseTypeData.Object.Get(), Obj, EFusionObjectPairType::Actor);
 		CopyLocalStateToObject(ObjectPair);
 
 		PhotonCommon::StringType ObjectIdString = Obj->Id;
-		FUSION_LOG("Created Object Id: %s  Scene: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->Scene, Obj->Words.Length, *BaseTypeData.Object->GetName());
+		FUSION_LOG("Created Object Id: %s  Map: %d   WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), Obj->GetMap(), Obj->Words.Length, *BaseTypeData.Object->GetName());
 
-		SharedMode::ObjectId* RequiredObjects = Obj->RequiredObjects();
+		auto RequiredObjects = Obj->RequiredObjects();
 		int32 RequiredObjectIndex = 0;
 
 		for (int i = 1; i < TypesData.Num(); i++) {
@@ -739,7 +835,7 @@ void UFusionClient::AttachSpawnedActor(UFusionActorComponent* Source, const uint
 
 			const uint32 SubObjectHash = UFusionHelpers::SafeObjectNameHash(SubObjectTypeData.Object.Get());
 
-			if (TStrongObjectPtr<UTypeDescriptor> Descriptor = Lookup->HashToDescriptor.FindRef(SubObjectTypeData.TypeRef.Hash))
+			if (TStrongObjectPtr<UFusionTypeDescriptor> Descriptor = Lookup->HashToDescriptor.FindRef(SubObjectTypeData.TypeRef.Hash))
 			{
 				FString SubObjectClassPath = Descriptor->Type.Get()->GetPathName();
 				TArray SubObjectsTypesData{SubObjectTypeData};
@@ -747,24 +843,24 @@ void UFusionClient::AttachSpawnedActor(UFusionActorComponent* Source, const uint
 				const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> SubObjectTypesJsonUTF8 = StringCast<UTF8CHAR>(*SubObjectTypesJson);
 
 				//Dynamic subobjects will get their ids same way as parent object.
-				SharedMode::ObjectId SubObjectId = Client->GetNewObjectId();
+				FusionCore::ObjectId SubObjectId = Client->GetNewObjectId(Obj->GetMap());
 
-				SharedMode::ObjectChild* SubObject = Client->CreateSubObject(Obj->Id, SubObjectTypeData.TypeRef.WordCount,
+				FusionCore::ObjectChild* SubObject = Client->CreateSubObject(Obj->Id, SubObjectTypeData.TypeRef.WordCount,
 					SubObjectTypeData.TypeRef,
 					reinterpret_cast<const PhotonCommon::CharType*>(SubObjectTypesJsonUTF8.Get()),
 					SubObjectTypesJsonUTF8.Length(),
 					SubObjectHash,
 					SubObjectId,
-					SubObjectTypeData.SpecialFlags);
+					static_cast<uint32_t>(SubObjectTypeData.SpecialFlags));
 
 				if (Client->AddSubObject(Obj, SubObject))
 				{
-					if (RequiredObjects && RequiredObjectIndex < SubObjectCount)
+					if (!RequiredObjects.empty() && RequiredObjectIndex < SubObjectCount)
 					{
 						RequiredObjects[RequiredObjectIndex++] = SubObject->Id;
 					}
 
-					auto SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), SubObject, EObjectPairType::Component);
+					auto SubObjectPair = RegisterObject(Source, Actor, SubObjectTypeData.Object.Get(), SubObject, EFusionObjectPairType::Component);
 					CopyLocalStateToObject(SubObjectPair);
 
 					PhotonCommon::StringType SubObjectIdString = SubObject->Id;
@@ -785,20 +881,20 @@ void UFusionClient::AttachSpawnedActor(UFusionActorComponent* Source, const uint
 	}
 }
 
-SharedMode::ObjectRoot* UFusionClient::FindRootParent(SharedMode::ObjectId Id)
+FusionCore::ObjectRoot* UFusionClient::FindRootParent(FusionCore::ObjectId Id)
 {
-	if (SharedMode::Object* Object = Client->FindObject(Id))
+	if (FusionCore::Object* Object = Client->FindObject(Id))
 	{
-		if (Object->ObjectType == SharedMode::ObjectType::Root)
+		if (FusionCore::ObjectRoot* Root = FusionCore::ObjectRoot::Cast(Object))
 		{
-			return SharedMode::ObjectRoot::Cast(Object);
+			return Root;
 		}
 
-		if (const SharedMode::ObjectChild* Child = SharedMode::ObjectChild::Cast(Object))
+		if (const FusionCore::ObjectChild* Child = FusionCore::ObjectChild::Cast(Object))
 		{
-			if (SharedMode::ObjectRoot* FoundParent = FindRootParent(Child->Parent))
+			if (FusionCore::ObjectRoot* FoundParent = FindRootParent(FusionCore::ObjectChild::GetParent(Child)))
 			{
-				return SharedMode::ObjectRoot::Cast(FoundParent);
+				return FusionCore::ObjectRoot::Cast(FoundParent);
 			}
 		}
 	}
@@ -806,11 +902,11 @@ SharedMode::ObjectRoot* UFusionClient::FindRootParent(SharedMode::ObjectId Id)
 	return nullptr;
 }
 
-SharedMode::Object* UFusionClient::CreateCustomObject(const FCopyContext& Context, UObject* Object, const UTypeDescriptor* Descriptor, uint32 Scene)
+FusionCore::Object* UFusionClient::CreateCustomObject(const FCopyContext& Context, UObject* Object, const UFusionTypeDescriptor* Descriptor, uint32 Scene)
 {
-	SharedMode::ObjectRoot* ParentObject{nullptr};
+	FusionCore::ObjectRoot* ParentObject{nullptr};
 	if (const UObject* Outer = Object->GetOuter()) {
-		if (SharedMode::ObjectRoot* FoundObject = Context.FusionClient->FindObjectRoot(Outer))
+		if (FusionCore::ObjectRoot* FoundObject = Context.FusionClient->FindObjectRoot(Outer))
 		{
 			ParentObject = FoundObject;
 		}
@@ -822,12 +918,12 @@ SharedMode::Object* UFusionClient::CreateCustomObject(const FCopyContext& Contex
 		//ParentObject = FindRootParent(Context.Pair.Object->Id);
 	}
 
-	SharedMode::ObjectId ParentId = ParentObject ? ParentObject->Id : SharedMode::ObjectId();
+	FusionCore::ObjectId ParentId = ParentObject ? ParentObject->Id : FusionCore::ObjectId();
 
 	if (ParentId.IsSome())
 	{
-		FObjectActorPair ParentPair = FindObjectPair(ParentId);
-		const SharedMode::TypeRef TypeRef = SharedMode::TypeRef{Descriptor->TypeHash, Descriptor->WordCount};
+		FFusionObjectActorPair ParentPair = FindObjectPair(ParentId);
+		const FusionCore::TypeRef TypeRef = FusionCore::TypeRef{Descriptor->TypeHash, Descriptor->WordCount};
 		
 		TArray<FTypeData> TypesData{};
 		const FTypeData TypeData {
@@ -841,25 +937,22 @@ SharedMode::Object* UFusionClient::CreateCustomObject(const FCopyContext& Contex
 		const FString TypesJson = UFusionHelpers::GetTypesHeader(this, TypesData);
 		const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> TypesJsonUTF8 = StringCast<UTF8CHAR>(*TypesJson);
 		
-		if (!MapActors.Contains(ParentId.Counter))
-		{
-			SharedMode::ObjectId SubObjectId =  Client->GetNewObjectId();
+		FusionCore::ObjectId SubObjectId =  Client->GetNewObjectId(ParentId.Map);
 
-			SharedMode::ObjectChild* SubObject = Client->CreateSubObject(ParentObject->Id,
-															 TypeRef.WordCount,
-															 TypeRef,
-															 reinterpret_cast<const PhotonCommon::CharType*>(TypesJsonUTF8.Get()),
-															 TypesJsonUTF8.Length(),
-															 SubObjectHash,
-															 SubObjectId,
-															 {});
-			Client->AddSubObject(ParentObject, SubObject);
-			const FObjectActorPair Pair = RegisterRuntimeObject(nullptr, ParentPair.Actor, Object, SubObject, EObjectPairType::CustomObject);
-			const PhotonCommon::StringType ObjectIdString = SubObject->Id;
-			FUSION_LOG("Created Custom Object Id: %s   Object Hash: %d    WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), SubObjectHash,  SubObject->Words.Length, *Object->GetName());
+		FusionCore::ObjectChild* SubObject = Client->CreateSubObject(ParentObject->Id,
+														 TypeRef.WordCount,
+														 TypeRef,
+														 reinterpret_cast<const PhotonCommon::CharType*>(TypesJsonUTF8.Get()),
+														 TypesJsonUTF8.Length(),
+														 SubObjectHash,
+														 SubObjectId,
+														 {});
+		Client->AddSubObject(ParentObject, SubObject);
+		const FFusionObjectActorPair Pair = RegisterRuntimeObject(nullptr, ParentPair.Actor, Object, SubObject, EFusionObjectPairType::CustomObject);
+		const PhotonCommon::StringType ObjectIdString = SubObject->Id;
+		FUSION_LOG("Created Custom Object Id: %s   Object Hash: %d    WordCount:%llu  From: %s ",  UTF8_TO_TCHAR(ObjectIdString.c_str()), SubObjectHash,  SubObject->Words.Length, *Object->GetName());
 
-			return Pair.Object;
-		}
+		return Pair.Object;
 	}
 
 	return nullptr;
@@ -884,17 +977,8 @@ void UFusionClient::TriggerMapLoad()
 
 	CurrentMapInstance.Name = NewLevelInstance.Name;
 	CurrentMapInstance.Sequence = NewLevelInstance.Sequence;
-	CurrentMapInstance.bAttachCurrent = NewLevelInstance.bAttachCurrent;
 	
 	TargetMapInstance.Name = FPackageName::GetShortName(NewLevelInstance.Name);
-
-	if (NewLevelInstance.bAttachCurrent)
-	{
-		//Move directly to active state, no map change will fire.
-		//From this state the local client can choose to AttachCurrentWorld (if not master)
-		SetMapState(EMapState::LevelActive);
-		return;
-	}
 
 	const UGameInstance* GameInstance = UGameplayStatics::GetGameInstance(CurrentWorld.Get());
 	if (!GameInstance)
@@ -910,8 +994,8 @@ void UFusionClient::TriggerMapLoad()
 	}
 	OnlineSubsystem->OnMapLoadRequestedEvent.Broadcast(CurrentMapInstance.Name);
 
-	if (const UPhotonOnlineSubsystemSettings* Settings =
-		UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings()) {
+	if (const UFusionOnlineSubsystemSettings* Settings =
+		UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings()) {
 		bool bLoadMapAutomatically = Settings->LoadMapAutomatically;
 
 		if (FusionCVars::LoadMapBehaviourOverride > 0) {
@@ -959,10 +1043,10 @@ void UFusionClient::InitializeNewRemoteObjects()
 {
 	for (int i = 0; i < NewRemoteObjectRoots.Num(); i++)
 	{
-		SharedMode::ObjectRoot* Obj = NewRemoteObjectRoots[i];
+		FusionCore::ObjectRoot* Obj = NewRemoteObjectRoots[i];
 
 		//Assume local client has locally connected these objects.
-		if ((Obj->SpecialFlags & SharedMode::ObjectSpecialFlags::ExistsOnClient) != SharedMode::ObjectSpecialFlags::None)
+		if ((Obj->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient)) != 0)
 		{
 			NewRemoteObjectRoots.RemoveAt(i);
 			i--;
@@ -970,7 +1054,7 @@ void UFusionClient::InitializeNewRemoteObjects()
 		}
 
 		// belongs to an old scene, ignore.
-		if (Obj->Scene < CurrentMapInstance.Sequence && Obj->Scene != 0)
+		if (Obj->GetMap() < CurrentMapInstance.Sequence && Obj->GetMap() != 0)
 		{
 			NewRemoteObjectRoots.RemoveAt(i);
 			i--;
@@ -978,12 +1062,12 @@ void UFusionClient::InitializeNewRemoteObjects()
 		}
 		
 		// belongs to a newer scene, ignore but don't remove
-		if (Obj->Scene > CurrentMapInstance.Sequence)
+		if (Obj->GetMap() > CurrentMapInstance.Sequence)
 		{
 			continue;
 		}
 
-		if (Obj->Scene == CurrentMapInstance.Sequence || Obj->Scene == 0)
+		if (Obj->GetMap() == CurrentMapInstance.Sequence || Obj->GetMap() == 0)
 		{
 			if (Obj->Engine == nullptr)
 			{
@@ -1003,8 +1087,8 @@ void UFusionClient::InitializeNewRemoteObjects()
 
 	for (int i = 0; i < NewRemoteObjectChildren.Num(); i++)
 	{
-		SharedMode::ObjectChild* Obj = NewRemoteObjectChildren[i];
-		const SharedMode::ObjectRoot* Root = Client->GetRoot(Obj);
+		FusionCore::ObjectChild* Obj = NewRemoteObjectChildren[i];
+		const FusionCore::ObjectRoot* Root = Client->GetRoot(Obj);
 
 		if (Root == nullptr)
 		{
@@ -1014,14 +1098,14 @@ void UFusionClient::InitializeNewRemoteObjects()
 		}
 
 		//Assume local client has locally connected these objects.
-		if ((Obj->SpecialFlags & SharedMode::ObjectSpecialFlags::ExistsOnClient) != SharedMode::ObjectSpecialFlags::None)
+		if ((Obj->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::ExistsOnClient)) != 0)
 		{
 			NewRemoteObjectChildren.RemoveAt(i);
 			i--;
 			continue;
 		}
 		
-		if (Root->Scene < CurrentMapInstance.Sequence && Root->Scene != 0)
+		if (Root->GetMap() < CurrentMapInstance.Sequence && Root->GetMap() != 0)
 		{
 			NewRemoteObjectChildren.RemoveAt(i);
 			i--;
@@ -1029,7 +1113,7 @@ void UFusionClient::InitializeNewRemoteObjects()
 		}
 		
 		// belongs to a newer scene, ignore but don't remove
-		if (Root->Scene > CurrentMapInstance.Sequence)
+		if (Root->GetMap() > CurrentMapInstance.Sequence)
 		{
 			continue;
 		}
@@ -1061,8 +1145,7 @@ void UFusionClient::InitializeNewLocalAndMapObjects()
 	for (int i = 0; i < PendingObjects.Num(); i++)
 	{
 		const FPendingObject Pending = PendingObjects[i];
-		const TObjectPtr<UFusionActorComponent> Source = Pending.Source;
-		
+
 		if (IsValid(Pending.Object) == false)
 		{
 			FUSION_LOG_ERROR("Pending Actor Object is invalid");
@@ -1070,7 +1153,10 @@ void UFusionClient::InitializeNewLocalAndMapObjects()
 			i--;
 			continue;
 		}
-	
+
+		const TObjectPtr<UFusionActorComponent> Source = Pending.Source;
+		FUSION_LOG("Process Pending Actor: %s Map: %d", *Pending.Object->GetName(), CurrentMapInstance.Sequence);
+
 		if (this->ObjectToObjectId.Contains(Pending.Object))
 		{
 			FUSION_LOG("Actor: %s already exists in mapped objects", *Pending.Object->GetName());
@@ -1083,7 +1169,7 @@ void UFusionClient::InitializeNewLocalAndMapObjects()
 
 		if (Pending.Object->IsA(UGameInstance::StaticClass()))
 		{
-			AttachGlobalInstanceActor(Pending.Object);
+			AttachGlobalInstanceActor(Source, 0, Pending.Object);
 		}
 		else
 		{
@@ -1111,7 +1197,7 @@ void UFusionClient::UpdateRemoteObjectsActorState(const double Dt)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::UpdateRemoteObjectsActorState::ValidateAndLookup);
 
-		SharedMode::Object* Current = Client->FindObject(Pair.ObjectId);
+		FusionCore::Object* Current = Client->FindObject(Pair.ObjectId);
 
 		if (!Current)
 		{
@@ -1119,21 +1205,15 @@ void UFusionClient::UpdateRemoteObjectsActorState(const double Dt)
 			continue;
 		}
 
-		//Since not every tick will have a network/plugin update we reset the received bytes
-		if (!Client->HasBeenUpdatedByPlugin(Current, false))
-		{
-			Current->ResetReceivedBytes();
-		}
-		
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::BeginFrame::UpdateRemoteObjectsActorState::GetRoot);
-			const SharedMode::ObjectRoot* Root = Client->GetRoot(Current);
+			const FusionCore::ObjectRoot* Root = Client->GetRoot(Current);
 			if (!Root) {
 				FUSION_LOG_ERROR("GetRoot returned null for object [%d:%d]", Pair.Object->Id.Origin, Pair.Object->Id.Counter);
 				continue;
 			}
 
-			if (Root->Scene != CurrentMapInstance.Sequence && Root->Scene != 0)
+			if (Root->GetMap() != CurrentMapInstance.Sequence && Root->GetMap() != 0)
 				continue;
 		}
 
@@ -1161,14 +1241,14 @@ void UFusionClient::UpdateRemoteObjectsActorState(const double Dt)
 		{
 			Pair.Actor->SetRole(ROLE_SimulatedProxy);
 		}
-		
+
 		UFusionActorComponent* Settings{nullptr};
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::BeginFrame::UpdateRemoteObjectsActorState::GetSettings);
 
-			if (SharedMode::ObjectChild* Child = SharedMode::ObjectChild::Cast(Pair.Object)) {
-				const SharedMode::ObjectId ParentId = SharedMode::ObjectId(Child->Parent);
-				if (const FObjectActorPair ParentPair = FindObjectPair(ParentId); ParentPair.Actor) {
+			if (FusionCore::ObjectChild* Child = FusionCore::ObjectChild::Cast(Pair.Object)) {
+				const FusionCore::ObjectId ParentId = FusionCore::ObjectId(FusionCore::ObjectChild::GetParent(Child));
+				if (const FFusionObjectActorPair ParentPair = FindObjectPair(ParentId); ParentPair.Actor) {
 					Settings = ParentPair.Actor->GetComponentByClass<UFusionActorComponent>();
 				}
 			}
@@ -1184,7 +1264,7 @@ void UFusionClient::UpdateRemoteObjectsActorState(const double Dt)
 	}
 }
 
-void UFusionClient::UpdateRemoteState(const FObjectActorPair& Pair, const FPackagedSettings& Settings, const double Dt)
+void UFusionClient::UpdateRemoteState(const FFusionObjectActorPair& Pair, const FPackagedSettings& Settings, const double Dt)
 {
 	FTransform PreviousTransform;
 	FVector PreviousLinVel;
@@ -1197,7 +1277,7 @@ void UFusionClient::UpdateRemoteState(const FObjectActorPair& Pair, const FPacka
 		TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::BeginFrame::UpdateRemoteObjectsActorState::PreForecast);
 		// When we have a component using Forecast physics, before copying/interpolating the values we grab the current body state
 		// so it can be reset after the copy/interpolation has happened.
-		// This is so the copy/interpolation can still happen for values other than the vales controlled by the Forecast system. 
+		// This is so the copy/interpolation can still happen for values other than the vales controlled by the Forecast system.
 		if (const UPrimitiveComponent* PrimComponent = Cast<UPrimitiveComponent>(Pair.EngineObject); PrimComponent && PrimComponent->IsSimulatingPhysics()) {
 			if (PrimComponent->GetOwner())
 			{
@@ -1230,7 +1310,7 @@ void UFusionClient::UpdateRemoteState(const FObjectActorPair& Pair, const FPacka
 		BodyInstance->SetBodyTransform(PreviousTransform, ETeleportType::TeleportPhysics, true);
 		BodyInstance->SetLinearVelocity(PreviousLinVel, false);
 		BodyInstance->SetAngularVelocityInRadians(PreviousAngVel, false);
-			
+
 	}
 }
 
@@ -1262,7 +1342,7 @@ void UFusionClient::TickInRoomAndRunningRemoveActors()
 
 	if (RemoveAfterEndBeginFrame.Num() > 0)
 	{
-		for (SharedMode::ObjectId Id : RemoveAfterEndBeginFrame)
+		for (FusionCore::ObjectId Id : RemoveAfterEndBeginFrame)
 		{
 			ObjectIdToPair.Remove(Id);
 		}
@@ -1293,7 +1373,7 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 		return;
 	}
 
-	TArray<SharedMode::ObjectChild*> SubObjectsToDestroy;
+	TArray<FusionCore::ObjectChild*> SubObjectsToDestroy;
 
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyAndSubObjects);
@@ -1302,7 +1382,7 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyAndSubObjects::ValidateAndLookup);
 
-			const SharedMode::Object* Current;
+			const FusionCore::Object* Current;
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyAndSubObjects::FindObject);
 				Current = Client->FindObject(Pair.ObjectId);
@@ -1314,7 +1394,7 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 				continue;
 			}
 
-			const SharedMode::ObjectRoot* Root;
+			const FusionCore::ObjectRoot* Root;
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyAndSubObjects::GetRoot);
 				Root = Client->GetRoot(Current);
@@ -1324,7 +1404,7 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 				continue;
 			}
 
-			if (Root->Scene != CurrentMapInstance.Sequence && Root->Scene != 0)
+			if (Root->GetMap() != CurrentMapInstance.Sequence && Root->GetMap() != 0)
 				continue;
 
 			{
@@ -1369,16 +1449,17 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 
 					CopyLocalStateToObject(Pair);
 				}
+
 			}
 
-			if (Pair.ObjectType == EObjectPairType::Actor && Pair.Actor)
+			if (Pair.ObjectType == EFusionObjectPairType::Actor && Pair.Actor)
 			{
 				if (CanModify)
 				{
 					//Find deleted subobjects
 					{
 						TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyAndSubObjects::FindDeletedSubObjects);
-						const std::vector<SharedMode::ObjectId>& RegisteredSubObjects = Client->GetSubObject(Pair.Object);
+						const std::vector<FusionCore::ObjectId>& RegisteredSubObjects = Client->GetSubObject(Pair.Object);
 
 						if (!RegisteredSubObjects.empty())
 						{
@@ -1386,12 +1467,12 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 
 							for (const auto& SubObjectId : RegisteredSubObjects)
 							{
-								if (const FObjectActorPair* SubObjectActorPair = ObjectIdToPair.Find(SubObjectId);
-									SubObjectActorPair && SubObjectActorPair->ObjectType == EObjectPairType::Component)
+								if (const FFusionObjectActorPair* SubObjectActorPair = ObjectIdToPair.Find(SubObjectId);
+									SubObjectActorPair && SubObjectActorPair->ObjectType == EFusionObjectPairType::Component)
 								{
 									if (!ActorComponents.Contains(Cast<UActorComponent>(SubObjectActorPair->EngineObject.Get())))
 									{
-										if (SharedMode::ObjectChild* Child = SharedMode::ObjectChild::Cast(SubObjectActorPair->Object))
+										if (FusionCore::ObjectChild* Child = FusionCore::ObjectChild::Cast(SubObjectActorPair->Object))
 										{
 											SubObjectsToDestroy.Add(Child);
 										}
@@ -1407,62 +1488,61 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 					auto ReplicatedComponents = Pair.Actor->GetReplicatedComponents();
 					for  (auto ReplicatedComponent : ReplicatedComponents)
 					{
-						//This will only work if the object is registered.
-						SharedMode::ObjectId ObjectId = FindObjectId(ReplicatedComponent);
-						SharedMode::Object* Object = Client->FindObject(ObjectId);
+					//This will only work if the object is registered.
+					FusionCore::ObjectId ObjectId = FindObjectId(ReplicatedComponent);
+					FusionCore::Object* Object = Client->FindObject(ObjectId);
 
-						if (!Object)
+					if (!Object)
+					{
+						FPropertyBuildOptions BuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
+						UFusionTypeDescriptor* Descriptor = Lookup->CreateTypeDescriptor(ReplicatedComponent->GetClass(), BuildOptions);
+						
+						FusionCore::TypeRef TypeRef{
+							Descriptor->TypeHash,
+							Descriptor->WordCount
+						};
+						
+						FTypeData SubObjectTypeData{
+							TypeRef,
+							ReplicatedComponent,
+						};
+						
+						TArray SubObjectsTypesData{SubObjectTypeData};
+						FString SubObjectTypesJson = UFusionHelpers::GetTypesHeader(this, SubObjectsTypesData);
+						const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> SubObjectTypesJsonUTF8 = StringCast<UTF8CHAR>(*SubObjectTypesJson);
+						
+						const uint32 SubObjectHash = UFusionHelpers::SafeObjectNameHash(SubObjectTypeData.Object.Get());
+
+						FusionCore::ObjectRoot* PairRoot = FusionCore::ObjectRoot::Cast(Pair.Object);
+
+						//Similar to parent container object we check if the subobjects just needs to get registered or created.
+						//We dont register mapactors or their subobjects in the OnObjectCreatedFinalize.
+						//This could potentially run in paralell with a remote scene object being created on the client.
+						FusionCore::Object* ExistingSubObject = Client->FindSubObjectWithHash(PairRoot, SubObjectHash);
+
+						//We dont allow adding dynamic component adding on map actors (for now)
+						if (!ExistingSubObject)
 						{
-							FPropertyBuildOptions BuildOptions = UTypeLookup::GetDefaultBuildOptions();
-							UTypeDescriptor* Descriptor = Lookup->CreateTypeDescriptor(ReplicatedComponent->GetClass(), BuildOptions);
+							FusionCore::ObjectId SubObjectId = Client->GetNewObjectId(Pair.Object->Id.Map);
 
-							SharedMode::TypeRef TypeRef{
-								Descriptor->TypeHash,
-								Descriptor->WordCount
-							};
+							auto SubObject = Client->CreateSubObject(Pair.Object->Id, Descriptor->WordCount,
+										TypeRef,
+										reinterpret_cast<const PhotonCommon::CharType*>(SubObjectTypesJsonUTF8.Get()),
+										SubObjectTypesJsonUTF8.Length(),
+										SubObjectHash,
+										SubObjectId,
+										static_cast<uint32_t>(SubObjectTypeData.SpecialFlags));
+				
 
-							FTypeData SubObjectTypeData{
-								TypeRef,
-								ReplicatedComponent,
-							};
-
-							TArray SubObjectsTypesData{SubObjectTypeData};
-							FString SubObjectTypesJson = UFusionHelpers::GetTypesHeader(this, SubObjectsTypesData);
-							const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> SubObjectTypesJsonUTF8 = StringCast<UTF8CHAR>(*SubObjectTypesJson);
-
-							const uint32 SubObjectHash = UFusionHelpers::SafeObjectNameHash(SubObjectTypeData.Object.Get());
-
-							SharedMode::ObjectRoot* PairRoot = SharedMode::ObjectRoot::Cast(Pair.Object);
-
-							//Similar to parent container object we check if the subobjects just needs to get registered or created.
-							//We dont register mapactors or their subobjects in the OnObjectCreatedFinalize.
-							//This could potentially run in paralell with a remote scene object being created on the client.
-							SharedMode::Object* ExistingSubObject = Client->FindSubObjectWithHash(PairRoot, SubObjectHash);
-
-							//We dont allow adding dynamic component adding on map actors (for now)
-							if (!ExistingSubObject && !MapActors.Contains(Pair.Object->Id.Counter))
+							if (Client->AddSubObject(PairRoot, SubObject))
 							{
-								SharedMode::ObjectId SubObjectId = Client->GetNewObjectId();
-
-								auto SubObject = Client->CreateSubObject(Pair.Object->Id, Descriptor->WordCount,
-											TypeRef,
-											reinterpret_cast<const PhotonCommon::CharType*>(SubObjectTypesJsonUTF8.Get()),
-											SubObjectTypesJsonUTF8.Length(),
-											SubObjectHash,
-											SubObjectId,
-											SubObjectTypeData.SpecialFlags);
-
-
-								if (Client->AddSubObject(PairRoot, SubObject))
-								{
-									auto NewSubObjectPair = RegisterRuntimeObject(nullptr, Pair.Actor, SubObjectTypeData.Object.Get(), SubObject, EObjectPairType::Component);
-									CopyLocalStateToObject(NewSubObjectPair);
-								}
-								else
-								{
-									PhotonCommon::StringType ParentId = Pair.Object->Id;
-									FUSION_LOG_ERROR("Subobject: %llu with hash: %d  and name: %s  is already added to parent: %s", SubObjectTypeData.TypeRef.Hash, SubObjectHash, *SubObjectTypeData.Object->GetName(), UTF8_TO_TCHAR(ParentId.c_str()));
-								}
+								auto NewSubObjectPair = RegisterRuntimeObject(nullptr, Pair.Actor, SubObjectTypeData.Object.Get(), SubObject, EFusionObjectPairType::Component);
+								CopyLocalStateToObject(NewSubObjectPair);
+							}
+							else
+							{
+								PhotonCommon::StringType ParentId = Pair.Object->Id;
+								FUSION_LOG_ERROR("Subobject: %llu with hash: %d  and name: %s  is already added to parent: %s", SubObjectTypeData.TypeRef.Hash, SubObjectHash, *SubObjectTypeData.Object->GetName(), UTF8_TO_TCHAR(ParentId.c_str()));
 							}
 						}
 					}
@@ -1470,12 +1550,13 @@ void UFusionClient::TickInRoomAndRunningEndFrame(const double Dt)
 				}
 			}
 		}
+		}
 	}
 
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::DestroySubObjects);
 
-		for (SharedMode::ObjectChild* SubObject : SubObjectsToDestroy)
+		for (FusionCore::ObjectChild* SubObject : SubObjectsToDestroy)
 		{
 			FUSION_LOG("Deleted sub object: [%u:%u]", SubObject->Id.Origin, SubObject->Id.Counter);
 			Client->DestroySubObjectLocal(SubObject);
@@ -1510,19 +1591,6 @@ void UFusionClient::RemoveSpawnBlockedCls(UClass* InClass)
 	BlockedClasses.Remove(InClass);
 }
 
-void UFusionClient::CheckForMasterChange()
-{
-	const bool bIsMasterClient = Client->IsMasterClient();
-
-	if (bIsMasterClient && !bPreviousMasterClientState)
-	{
-		SequenceIncrementAmount = 1000;
-		FUSION_LOG("Just became Master Client");
-	}
-
-	bPreviousMasterClientState = bIsMasterClient;
-}
-
 void UFusionClient::Tick(const double Dt)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::Tick);
@@ -1536,33 +1604,36 @@ void UFusionClient::Tick(const double Dt)
 		case EMapState::Shutdown:
 			Client->UpdateServiceOnly(); //We need to run load balancer service when shutting down in order for client state to be put into correct state.
 			break;
+
+		case EMapState::WaitingToAttach:
+			Client->UpdateServiceOnly(); //We need to run load balancer service when shutting down in order for client state to be put into correct state.
+			break;
 		
 		case EMapState::MasterClientChangeWorld:
-		if (WorldChangeRequest.bIsActive)
-		{
-			WorldChangeRequest.bIsActive = false;
-			
-			if (const FWorldContext* WorldContext = GEngine->GetWorldContextFromWorld(CurrentWorld.Get()))
+			if (WorldChangeRequest.bIsActive)
 			{
-				TravelInternal(WorldChangeRequest.WorldName);
-				PreMapLoad(*WorldContext, WorldChangeRequest.WorldName, true);
+				WorldChangeRequest.bIsActive = false;
+				
+				if (const FWorldContext* WorldContext = GEngine->GetWorldContextFromWorld(CurrentWorld.Get()))
+				{
+					TravelInternal(WorldChangeRequest.WorldName);
+					PreMapLoad(*WorldContext, WorldChangeRequest.WorldName, true);
+				}
 			}
-		}
-		else
-		{
-			FUSION_LOG_ERROR("EMapState::MasterClientChangeWorld is in an invalid state");
-		}
-		break;
+			else
+			{
+				FUSION_LOG_ERROR("EMapState::MasterClientChangeWorld is in an invalid state");
+			}
+			break;
 	
 		case EMapState::LevelActive:
-
-			CheckForMasterChange();
 
 			// Depending on the initialization order, the PlayerController NetConnection may need to be updated
 			if (PlayerController && !PlayerController->NetConnection && FusionNetDriver)
 			{
 				PlayerController->NetConnection = FusionNetDriver->ServerConnection;
 			}
+
 
 			// If there has been a request to change level then move to the next state.
 			// This should only happen on master clients.
@@ -1599,7 +1670,13 @@ void UFusionClient::Tick(const double Dt)
 				TickInRoomAndRunningBeginFrame(Dt);
 			}
 
-			// 5. clean up old/invalid actor pairs
+			// 5. Modify GameMode/GameState
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::Tick::UpdateGameState);
+				UpdateGameState();
+			}
+
+			// 6. clean up old/invalid actor pairs
 			{
 				TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::Tick::RemoveActors);
 				TickInRoomAndRunningRemoveActors();
@@ -1643,28 +1720,19 @@ void UFusionClient::TriggerLevelChanged(const FString& MapName, bool AttachCurre
 {
 	if (Client->IsMasterClient())
 	{
-		CurrentMapInstance.Sequence += SequenceIncrementAmount;
 		CurrentMapInstance.Name = MapName;
-		
-		FUSION_LOG("Starting to load map (mc): %s (%i)", *CurrentMapInstance.Name, CurrentMapInstance.Sequence);
-		
+
 		const TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 		Payload->SetStringField(TEXT("MapName"), CurrentMapInstance.Name);
 		Payload->SetBoolField(TEXT("Attached"), AttachCurrent);
-
+    
 		FString PayloadString;
 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&PayloadString);
 		FJsonSerializer::Serialize(Payload, Writer);
 
 		const TStringConversion<TStringConvert<TCHAR, UTF8CHAR>> MapNameUTF8 = StringCast<UTF8CHAR>(*PayloadString);
-			
-		// trigger level change for other clients
-		Client->ChangeScene(0, CurrentMapInstance.Sequence, reinterpret_cast<const PhotonCommon::CharType*>(MapNameUTF8.Get()));
-
-		if (SequenceIncrementAmount > 1)
-		{
-			SequenceIncrementAmount = 1;
-		}
+		CurrentMapInstance.Sequence = Client->MapChange(reinterpret_cast<const PhotonCommon::CharType*>(MapNameUTF8.Get()));
+		FUSION_LOG("Starting to load map (mc): %s (%i)", *CurrentMapInstance.Name, CurrentMapInstance.Sequence);
 	}
 	else
 	{
@@ -1694,9 +1762,9 @@ double UFusionClient::NetworkTimeScale()
 
 double UFusionClient::ActorNetworkTime(const AActor* Actor)
 {
-	if (const SharedMode::ObjectId Id = FindObjectId(Actor); Id.IsSome())
+	if (const FusionCore::ObjectId Id = FindObjectId(Actor); Id.IsSome())
 	{
-		if (const FObjectActorPair* Pair = ObjectIdToPair.Find(Id))
+		if (const FFusionObjectActorPair* Pair = ObjectIdToPair.Find(Id))
 		{
 			return Client->GetTime(Pair->Object);
 		}
@@ -1705,23 +1773,81 @@ double UFusionClient::ActorNetworkTime(const AActor* Actor)
 	return 0;
 }
 
-void UFusionClient::CopyRemoteStateToObject(FCopyContext& Context, const FObjectActorPair& Pair, const bool IsInitialUpdate)
+// Recursively update change tracking for the receive path. For leaf states, compares
+// against PreviousReceivedWords. For states with sub-properties, recurses and sums.
+static void UpdateReceivedWordStates(FPropertyWordState& State, const SharedMode::Word* Current)
 {
-	SharedMode::TypeRef TypeRef = Pair.Object->Type;
-	const TStrongObjectPtr<UTypeDescriptor>* DescPtr = Lookup->HashToDescriptor.Find(TypeRef.Hash);
+	if (State.SubPropertyStates.Num() > 0)
+	{
+		int32 TotalChanged = 0;
+		for (FPropertyWordState& Sub : State.SubPropertyStates)
+		{
+			UpdateReceivedWordStates(Sub, Current + Sub.WordOffset);
+			TotalChanged += Sub.ChangedWordCount;
+		}
+		State.ChangedWordCount = TotalChanged;
+	}
+	else
+	{
+		if (State.PreviousReceivedWords.Num() != State.WordCount)
+		{
+			State.PreviousReceivedWords.SetNumZeroed(State.WordCount);
+		}
+		int32 ChangedWords = 0;
+		for (int32 i = 0; i < State.WordCount; ++i)
+		{
+			if (Current[i] != State.PreviousReceivedWords[i])
+			{
+				++ChangedWords;
+				State.PreviousReceivedWords[i] = Current[i];
+			}
+		}
+		State.ChangedWordCount = ChangedWords;
+	}
+}
 
-	if (!DescPtr || !DescPtr->IsValid() || !DescPtr->Get()->Type) {
+// Recursively update change tracking for the send path. Compares Current vs Shadow words.
+static void UpdateLocalWordStates(FPropertyWordState& State, const SharedMode::Word* Current, const SharedMode::Word* Shadow)
+{
+	if (State.SubPropertyStates.Num() > 0)
+	{
+		int32 TotalChanged = 0;
+		for (FPropertyWordState& Sub : State.SubPropertyStates)
+		{
+			UpdateLocalWordStates(Sub, Current + Sub.WordOffset, Shadow + Sub.WordOffset);
+			TotalChanged += Sub.ChangedWordCount;
+		}
+		State.ChangedWordCount = TotalChanged;
+	}
+	else
+	{
+		int32 ChangedWords = 0;
+		for (int32 i = 0; i < State.WordCount; ++i)
+		{
+			if (Current[i] != Shadow[i])
+			{
+				++ChangedWords;
+			}
+		}
+		State.ChangedWordCount = ChangedWords;
+	}
+}
+
+void UFusionClient::CopyRemoteStateToObject(FCopyContext& Context, const FFusionObjectActorPair& Pair, const bool IsInitialUpdate)
+{
+	FusionCore::TypeRef TypeRef = Pair.Object->Type;
+	const TStrongObjectPtr<UFusionTypeDescriptor> Desc = Lookup->HashToDescriptor.FindRef(TypeRef.Hash);
+
+	if (!Desc || !Desc->Type) {
 		//FUSION_LOG("Failed to find class of type %llu", TypeRef.Hash);
 		return;
 	}
-
-	const UTypeDescriptor* Desc = DescPtr->Get();
 
 	UObject* Container;
 
 	bool bSkipPreNetReceive = false;
 	bool bSkipPostNetReceive = false;
-
+	
 	if (Desc->Type->IsChildOf(AActor::StaticClass())) {
 		Container = Pair.EngineObject;
 		
@@ -1755,11 +1881,28 @@ void UFusionClient::CopyRemoteStateToObject(FCopyContext& Context, const FObject
 			Container->PreNetReceive();
 		}
 		
-		bool IsRootTransform = (Pair.Object->SpecialFlags & SharedMode::ObjectSpecialFlags::IsRootTransform) != SharedMode::ObjectSpecialFlags::None;
-		bool IgnoreRootTransformProperties = (Pair.Object->SpecialFlags & SharedMode::ObjectSpecialFlags::IgnoreRootTransformProperties) != SharedMode::ObjectSpecialFlags::None;
+		bool IsRootTransform = (Pair.Object->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::IsRootTransform)) != 0;
+		bool IgnoreRootTransformProperties = (Pair.Object->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::IgnoreRootTransformProperties)) != 0;
 
-		for (const Property* Prop : Desc->Properties) {
+		const bool bHasMatchingStates = Pair.PropertyStates.Num() == Desc->Properties.Num();
+		// PropertyStates is a mutable bookkeeping cache (change-counts, previous-words snapshots)
+		// alongside the otherwise-const pair data, so cast away const for that access only.
+		TArray<FPropertyWordState>& PropertyStates = const_cast<TArray<FPropertyWordState>&>(Pair.PropertyStates);
+
+		for (int32 Index = 0; Index < Desc->Properties.Num(); ++Index) {
+			const Property* Prop = Desc->Properties[Index];
 			check(Prop->WordOffset < Pair.Object->Words.Length);
+
+			SharedMode::Word* Current = Pair.Object->Words.Ptr + Prop->WordOffset;
+
+			//Track how many words changed since the last receive. We can't use the shadow buffer
+			//as a previous-state reference on the receive path, so each property carries its own
+			//snapshot in PropertyStates[Index].PreviousWords.
+			if (bHasMatchingStates)
+			{
+				FPropertyWordState& State = PropertyStates[Index];
+				UpdateReceivedWordStates(State, Current);
+			}
 
 			//Special case where initial values are updated for properties when object is created.
 			//Subsequent updates will be ignored for this property. This is mostly useful for root transform properties that have alternate update paths, eg: being updated by physics or movement component.
@@ -1770,8 +1913,8 @@ void UFusionClient::CopyRemoteStateToObject(FCopyContext& Context, const FObject
 					continue;
 				}
 			}
-	
-			Prop->CopyFrom(this, Context, Container, Pair.Object->Words.Ptr + Prop->WordOffset, Pair.Object->Shadow.Ptr + Prop->WordOffset, false);
+
+			Prop->CopyFrom(this, Context, Container, Current, Pair.Object->Shadow.Ptr + Prop->WordOffset);
 		}
 		
 		if (!bSkipPostNetReceive) {
@@ -1784,7 +1927,7 @@ void UFusionClient::CopyRemoteStateToObject(FCopyContext& Context, const FObject
 		Container->PostRepNotifies();
 
 		//Object has completed a full state update.
-		Pair.Object->SetHasValidData(true); 
+		Pair.Object->SetHasValidData();
 
 		//Checks if some other object has a dependency to the current one being updated.
 		if (DependencyChecks.Contains(Pair.Object->Id) && Context.bDoDependencyChecks)
@@ -1915,18 +2058,17 @@ void UFusionClient::ClearOwnerCooldown(const AActor* Actor)
 	}
 }
 
-void UFusionClient::CopyLocalStateToObject(FObjectActorPair& Pair)
+void UFusionClient::CopyLocalStateToObject(FFusionObjectActorPair& Pair)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::EndFrame::CopyLocalStateToObject);
-	SharedMode::TypeRef TypeRef = Pair.Object->Type;
-	const TStrongObjectPtr<UTypeDescriptor>* DescPtr = Lookup->HashToDescriptor.Find(TypeRef.Hash);
 
-	if (!DescPtr || !DescPtr->IsValid() || !DescPtr->Get()->Type) {
+	FusionCore::TypeRef TypeRef = Pair.Object->Type;
+	const TStrongObjectPtr<UFusionTypeDescriptor> Desc = Lookup->HashToDescriptor.FindRef(TypeRef.Hash);
+
+	if (!Desc || !Desc->Type) {
 		//FUSION_LOG("Failed to find class of type %llu", TypeRef.Hash);
 		return;
 	}
-
-	const UTypeDescriptor* Desc = DescPtr->Get();
 
 	if (Pair.EngineObject) {
 		FCopyContext Root
@@ -1934,8 +2076,7 @@ void UFusionClient::CopyLocalStateToObject(FObjectActorPair& Pair)
 			Pair,
 			this
 		};
-
-		const bool bHasShadow = Pair.Object->Shadow.Ptr != nullptr && Pair.Object->Shadow.Length == Pair.Object->Words.Length;
+		
 		const bool bHasMatchingStates = Pair.PropertyStates.Num() == Desc->Properties.Num();
 
 		for (int32 Index = 0; Index < Desc->Properties.Num(); ++Index)
@@ -1944,27 +2085,15 @@ void UFusionClient::CopyLocalStateToObject(FObjectActorPair& Pair)
 			const int32 Offset = Prop->WordOffset;
 			check(Offset < Pair.Object->Words.Length);
 
-			Prop->CopyTo(this, Root, Pair.EngineObject, Pair.Object->Words.Ptr + Offset);
+			Prop->CopyTo(this, Root, Pair.PropertyStates[Index], Pair.EngineObject, Pair.Object->Words.Ptr + Offset);
 
 			if (bHasMatchingStates)
 			{
 				FPropertyWordState& State = Pair.PropertyStates[Index];
-				int32 ChangedWords = 0;
 
-				if (bHasShadow)
-				{
-					const SharedMode::Word* Current = Pair.Object->Words.Ptr + Offset;
-					const SharedMode::Word* Shadow = Pair.Object->Shadow.Ptr + Offset;
-					for (int32 WordIndex = 0; WordIndex < Prop->WordCount; ++WordIndex)
-					{
-						if (Current[WordIndex] != Shadow[WordIndex])
-						{
-							++ChangedWords;
-						}
-					}
-				}
-
-				State.ChangedWordCount = ChangedWords;
+				const SharedMode::Word* Current = Pair.Object->Words.Ptr + Offset;
+				const SharedMode::Word* Shadow = Pair.Object->Shadow.Ptr + Offset;
+				UpdateLocalWordStates(State, Current, Shadow);
 			}
 		}
 	}
@@ -1972,6 +2101,10 @@ void UFusionClient::CopyLocalStateToObject(FObjectActorPair& Pair)
 
 void UFusionClient::OnActorSpawned(AActor* SpawnedActor)
 {
+	bool IsConnected = RealtimeClient && RealtimeClient->IsValid() && RealtimeClient->IsConnected();
+	if (!IsConnected)
+		return;
+
 	if (APlayerController* const SpawnedPlayerController = Cast<APlayerController>(SpawnedActor))
 	{
 		PlayerController = SpawnedPlayerController;
@@ -1979,6 +2112,25 @@ void UFusionClient::OnActorSpawned(AActor* SpawnedActor)
 		if (FusionNetDriver)
 		{
 			PlayerController->NetConnection = FusionNetDriver->ServerConnection;
+		}
+	}
+
+	if (SpawnedActor->IsA(AGameStateBase::StaticClass()))
+	{
+		if (UFusionActorComponent* SourceComp = SpawnedActor->GetComponentByClass<UFusionActorComponent>())
+		{
+			SourceComp->Ownership = EFusionObjectOwnerFlags::MasterClient;
+			
+			AddActorSource(SourceComp);
+		}
+		else
+		{
+			UFusionActorComponent* NewSource = NewObject<UFusionActorComponent>(SpawnedActor);
+			NewSource->Ownership = EFusionObjectOwnerFlags::MasterClient;
+			NewSource->bSkipAutoAttach = true;
+			NewSource->RegisterComponent();
+			
+			AddActorSource(NewSource);
 		}
 	}
 
@@ -2018,37 +2170,40 @@ void UFusionClient::OnActorSpawned(AActor* SpawnedActor)
 	}
 }
 
-void UFusionClient::OnEngineObjectDestroyed(const UObject* DestroyedObject, const bool bEngineObjectDestroyed)
+void UFusionClient::OnEngineObjectDestroyed(AActor* Actor)
 {
-	if (bBlockNextDestroy)
+	bool IsConnected = RealtimeClient && RealtimeClient->IsValid() && RealtimeClient->IsConnected();
+	if (!IsConnected)
+		return;
+	
+	if (RemoteDestroyedObjects.Remove(Actor) > 0)
 	{
-		bBlockNextDestroy = false;
 		return;
 	}
 	
-	SharedMode::ObjectId id = FindObjectId(DestroyedObject);
+	FusionCore::ObjectId id = FindObjectId(Actor);
 	if (id.IsSome())
 	{
-		FObjectActorPair Pair = FindObjectPair(id);
+		FFusionObjectActorPair Pair = FindObjectPair(id);
 		if (Pair.IsValid())
 		{
 			Pair.Settings->OnObjectDestroyed.Broadcast(EFusionObjectDestroyMode::Local);
 			
-			SharedMode::ObjectRoot* RootObject = SharedMode::ObjectRoot::Cast(Pair.Object);
-			if (Client->DestroyObjectLocal(RootObject, bEngineObjectDestroyed) == false)
+			FusionCore::ObjectRoot* RootObject = FusionCore::ObjectRoot::Cast(Pair.Object);
+			if (Client->DestroyObjectLocal(RootObject, true) == false)
 			{
-				FUSION_LOG_WARN("Engine destroyed actor %s which we don't have authority to destroy", *DestroyedObject->GetName());
+				FUSION_LOG_WARN("Engine destroyed actor %s which we don't have authority to destroy", *Actor->GetName());
 			}
 		}
 		else
 		{
-			FUSION_LOG_ERROR("Engine destroyed actor %s which doesnt have a mapped object pair", *DestroyedObject->GetName());
+			FUSION_LOG_ERROR("Engine destroyed actor %s which doesnt have a mapped object pair", *Actor->GetName());
 
-			if (SharedMode::ObjectRoot* RootObject = FindObjectRoot(DestroyedObject))
+			if (FusionCore::ObjectRoot* RootObject = FindObjectRoot(Actor))
 			{
-				if (Client->DestroyObjectLocal(RootObject, bEngineObjectDestroyed) == false)
+				if (Client->DestroyObjectLocal(RootObject, true) == false)
 				{
-					FUSION_LOG_WARN("Engine destroyed actor %s which we don't have authority to destroy", *DestroyedObject->GetName());
+					FUSION_LOG_WARN("Engine destroyed actor %s which we don't have authority to destroy", *Actor->GetName());
 				}
 			}
 		}
@@ -2060,18 +2215,14 @@ void UFusionClient::UpdateOwnedActorAreaInterestKeys(TFunctionRef<uint64(const A
 {
 	for (auto& [_, Pair] : ObjectIdToPair)
 	{
-		if (SharedMode::ObjectRoot::Cast(Pair.Object) == nullptr) continue;
+		if (FusionCore::ObjectRoot::Cast(Pair.Object) == nullptr) continue;
 		if (!Pair.Actor) continue;
-
-		bool CanModify;
 		{
 			TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::UpdateOwnedActorAreaInterestKeys::CanModify);
-			CanModify = Client->CanModify(Pair.Object);
+			if (!Client->CanModify(Pair.Object)) continue;
 		}
 
-		if (!CanModify) continue;
-
-		if (Client->HasSetInterestKey(Pair.Object) && Client->GetInterestKeyType(Pair.Object) != SharedMode::InterestKeyType::Area) {
+		if (Client->HasSetInterestKey(Pair.Object) && Client->GetInterestKeyType(Pair.Object) != FusionCore::InterestKeyType::Area) {
 			continue;
 			}
 
@@ -2081,7 +2232,64 @@ void UFusionClient::UpdateOwnedActorAreaInterestKeys(TFunctionRef<uint64(const A
 	}
 }
 
-void UFusionClient::AddDependencyCheck(const SharedMode::ObjectId Id, const FCopyContext& Root, const TFunction<bool()>& Callback)
+void UFusionClient::UpdateGameState()
+{
+	auto WorldPtr = CurrentWorld.Get();
+	if (!WorldPtr)
+		return;
+	
+	if (AGameStateBase* GameState = WorldPtr->GetGameState())
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(FusionClient::Tick::UpdateGameModeTime);
+
+		// ReplicatedWorldTimeSeconds[Double] are protected on AGameStateBase, so reach them via
+		// reflection rather than forcing the project to derive from a Fusion-specific GameState.
+		static const FDoubleProperty* TimeDoubleProp = FindFProperty<FDoubleProperty>(
+			AGameStateBase::StaticClass(), TEXT("ReplicatedWorldTimeSecondsDouble"));
+		static const FFloatProperty* TimeFloatProp = FindFProperty<FFloatProperty>(
+			AGameStateBase::StaticClass(), TEXT("ReplicatedWorldTimeSeconds"));
+
+		const double NetTime = ActorNetworkTime(GameState);
+
+		if (TimeDoubleProp)
+		{
+			*TimeDoubleProp->ContainerPtrToValuePtr<double>(GameState) = NetTime;
+		}
+		if (TimeFloatProp)
+		{
+			*TimeFloatProp->ContainerPtrToValuePtr<float>(GameState) = static_cast<float>(NetTime);
+		}
+
+		// Mirror MatchState from GameState onto the local GameMode on non-master clients.
+		// AGameState::OnRep_MatchState has already been dispatched by Fusion's rep-notify path
+		// when the synced value changed, so client-side handlers have run. We only patch the
+		// GameMode field directly to keep GameMode->GetMatchState() consistent for any code
+		// that reads it -- going through AGameMode::SetMatchState would re-fire server-only
+		// handlers (HandleMatchHasStarted -> RestartPlayer / SwapPlayerControllers / etc.).
+		if (!Client->IsMasterClient())
+		{
+			if (AGameState* State = Cast<AGameState>(WorldPtr->GetGameState()))
+			{
+				if (AGameMode* GameMode = Cast<AGameMode>(WorldPtr->GetAuthGameMode()))
+				{
+					static const FNameProperty* MatchStateProp = FindFProperty<FNameProperty>(
+						AGameMode::StaticClass(), TEXT("MatchState"));
+					if (MatchStateProp)
+					{
+						FName& Field = *MatchStateProp->ContainerPtrToValuePtr<FName>(GameMode);
+						const FName NewState = State->GetMatchState();
+						if (Field != NewState)
+						{
+							Field = NewState;
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+void UFusionClient::AddDependencyCheck(const FusionCore::ObjectId Id, const FCopyContext& Root, const TFunction<bool()>& Callback)
 {
 	if (DependencyChecks.Contains(Id))
 	{
@@ -2148,32 +2356,32 @@ void UFusionClient::AddActorSource(UFusionActorComponent* Source)
 	}
 }
 
-SharedMode::ObjectId UFusionClient::FindObjectId(const UObject* Object)
+FusionCore::ObjectId UFusionClient::FindObjectId(const UObject* Object)
 {
 	if (Object)
 	{
 		if (const uint64* Result = ObjectToObjectId.Find(Object); Result)
 		{
-			return SharedMode::ObjectId(*Result);
+			return FusionCore::ObjectId(*Result);
 		}
 
 		if (const uint64* Result = TempObjectToObjectId.Find(Object); Result)
 		{
-			return SharedMode::ObjectId(*Result);
+			return FusionCore::ObjectId(*Result);
 		}
 	}
 
-	return SharedMode::ObjectId();
+	return FusionCore::ObjectId();
 }
 
-UObject* UFusionClient::FindObject(const SharedMode::ObjectId Id)
+UObject* UFusionClient::FindObject(const FusionCore::ObjectId Id)
 {
-	if (const FObjectActorPair* Result = ObjectIdToPair.Find(Id))
+	if (const FFusionObjectActorPair* Result = ObjectIdToPair.Find(Id))
 	{
 		return Result->EngineObject;
 	}
 
-	if (const FObjectActorPair* Result = TempObjectIdToPair.Find(Id))
+	if (const FFusionObjectActorPair* Result = TempObjectIdToPair.Find(Id))
 	{
 		return Result->EngineObject;
 	}
@@ -2181,21 +2389,21 @@ UObject* UFusionClient::FindObject(const SharedMode::ObjectId Id)
 	return nullptr;
 }
 
-FObjectActorPair UFusionClient::FindObjectPair(SharedMode::ObjectId Id)
+FFusionObjectActorPair UFusionClient::FindObjectPair(FusionCore::ObjectId Id)
 {
-	if (const FObjectActorPair* Result = ObjectIdToPair.Find(Id))
+	if (const FFusionObjectActorPair* Result = ObjectIdToPair.Find(Id))
 	{
 		return *Result;
 	}
 
-	return FObjectActorPair();
+	return FFusionObjectActorPair();
 }
 
-SharedMode::Object* UFusionClient::FindObject(const UObject* Object)
+FusionCore::Object* UFusionClient::FindObject(const UObject* Object)
 {
 	if (Client)
 	{
-		if (const SharedMode::ObjectId Id = FindObjectId(Object); Id.IsSome())
+		if (const FusionCore::ObjectId Id = FindObjectId(Object); Id.IsSome())
 		{
 			return Client->FindObject(Id);
 		}
@@ -2204,11 +2412,11 @@ SharedMode::Object* UFusionClient::FindObject(const UObject* Object)
 	return nullptr;
 }
 
-SharedMode::ObjectRoot* UFusionClient::FindObjectRoot(const UObject* Actor)
+FusionCore::ObjectRoot* UFusionClient::FindObjectRoot(const UObject* Actor)
 {
 	if (Client)
 	{
-		if (const SharedMode::ObjectId Id = FindObjectId(Actor); Id.IsSome())
+		if (const FusionCore::ObjectId Id = FindObjectId(Actor); Id.IsSome())
 		{
 			return Client->FindObjectRoot(Id);
 		}
@@ -2249,30 +2457,28 @@ void UFusionClient::OnForcedDisconnect(FString Message)
 	}
 }
 
-void UFusionClient::OnObjectReady(SharedMode::ObjectRoot* Obj)
+void UFusionClient::OnObjectReady(FusionCore::ObjectRoot* Obj)
 {
 	NewRemoteObjectRoots.Add(Obj);
 
-	SharedMode::ObjectId* required = Obj->RequiredObjects();
-	const int32_t count = Obj->RequiredObjectsCount();
-	for (int32_t i = 0; i < count; i++)
+	for (const auto& id : Obj->RequiredObjects())
 	{
-		if (auto* child = SharedMode::ObjectChild::Cast(Client->FindObject(required[i])))
+		if (auto* child = FusionCore::ObjectChild::Cast(Client->FindObject(id)))
 		{
 			NewRemoteObjectChildren.Add(child);
 		}
 	}
 }
 
-void UFusionClient::OnSubObjectCreated(SharedMode::ObjectChild* Obj)
+void UFusionClient::OnSubObjectCreated(FusionCore::ObjectChild* Obj)
 {
 	NewRemoteObjectChildren.Add(Obj);
 }
 
-void UFusionClient::CopyToBackBuffer(const FObjectActorPair& Pair)
+void UFusionClient::CopyToBackBuffer(FFusionObjectActorPair& Pair)
 {
-	SharedMode::TypeRef TypeRef = Pair.Object->Type;
-	const TStrongObjectPtr<UTypeDescriptor> Desc = Lookup->HashToDescriptor.FindRef(TypeRef.Hash);
+	FusionCore::TypeRef TypeRef = Pair.Object->Type;
+	const TStrongObjectPtr<UFusionTypeDescriptor> Desc = Lookup->HashToDescriptor.FindRef(TypeRef.Hash);
 
 	if (!Desc || !Desc->Type) {
 		//FUSION_LOG("Failed to find class of type %llu", TypeRef.Hash);
@@ -2286,29 +2492,37 @@ void UFusionClient::CopyToBackBuffer(const FObjectActorPair& Pair)
 			Pair,
 			this
 		};
-		
-		for (const Property* Prop : Desc->Properties)
+
+		for (int Index = 0; Index < Desc->Properties.Num(); ++Index)
 		{
-			check(Prop->WordOffset < Pair.Object->Words.Length);
-			Prop->CopyTo(this, Context, Pair.EngineObject, Pair.Object->Shadow.Ptr + Prop->WordOffset);
+			const Property* Prop = Desc->Properties[Index];
+			const int32 Offset = Prop->WordOffset;
+			check(Offset < Pair.Object->Words.Length);
+			Prop->CopyTo(this, Context, Pair.PropertyStates[Index], Pair.EngineObject, Pair.Object->Shadow.Ptr + Prop->WordOffset);
 		}
 	}
 }
 
-bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
+bool UFusionClient::OnObjectCreatedFinalize(FusionCore::Object* Obj)
 {
 	if (!CurrentWorld.IsValid())
 	{
 		FUSION_LOG_ERROR("OnObjectCreatedFinalize: No world set!");
 		return false;
 	}
+
+	if (!Obj)
+	{
+		FUSION_LOG_ERROR("OnObjectCreatedFinalize: Object is nullptr");
+		return false;
+	}
 	
-	if (Obj->Header.Length > 0)
+	if (Obj->EngineBlob.Length > 0)
 	{
 		TArray<UClass*> LoadedClasses;
 		TArray<FString> LoadedNames;
-		
-		FString TypesJson(Obj->Header.Length, reinterpret_cast<char*>(Obj->Header.Ptr));
+
+		FString TypesJson(Obj->EngineBlob.Length, reinterpret_cast<char*>(Obj->EngineBlob.Ptr));
 		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(TypesJson);
 		if (TSharedPtr<FJsonObject> RootObject; FJsonSerializer::Deserialize(Reader, RootObject) && RootObject.IsValid())
 		{
@@ -2322,7 +2536,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 
 					if (UClass* FoundClass = LoadObject<UClass>(nullptr, *ClassPath))
 					{
-						FPropertyBuildOptions BuildOptions = UTypeLookup::GetDefaultBuildOptions();
+						FPropertyBuildOptions BuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
 						Lookup->CreateTypeDescriptor(FoundClass, BuildOptions);
 
 						LoadedClasses.Add(FoundClass);
@@ -2398,10 +2612,10 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 				RemoveSpawnBlockedCls(APlayerState::StaticClass());
 			}
 
-			SharedMode::TypeRef BaseTypeRef = TypesData[0].TypeRef;
-			FObjectActorPair Pair = RegisterObject(ActorSource, Actor, Actor, Obj, EObjectPairType::Actor);
+			FusionCore::TypeRef BaseTypeRef = TypesData[0].TypeRef;
+			FFusionObjectActorPair Pair = RegisterObject(ActorSource, Actor, Actor, Obj, EFusionObjectPairType::Actor);
 
-			//CopyLocalStateToObject(FObjectActorPair{Actor, Actor, Actor->GetName(), Obj});
+			//CopyLocalStateToObject(FFusionObjectActorPair{Actor, Actor, Actor->GetName(), Obj});
 			//Obj->CopyPluginReceivedWordsToLocalWordBuffer();
 
 			uint64 WordCount = 0;
@@ -2426,20 +2640,18 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 			CopyToBackBuffer(Pair);
 
 			FusionComponent->SubscribeEvents(Client, Obj->Id);
-			
 			FusionComponent->OnObjectReady.Broadcast();
-
-			FUSION_LOG("Engine Object Created %s (obj-lvlseq:%i, client-lvlseq:%i ActorName: %s, Words: %llu)", *ObjectIdToString(Obj->Id), Client->GetRoot(Obj)->Scene, CurrentMapInstance.Sequence, *Actor->GetName(), WordCount);
+			FUSION_LOG("Engine Object Created %s (obj-map:%i, client-map:%i ActorName: %s, Words: %llu)", *ObjectIdToString(Obj->Id), Client->GetRoot(Obj)->GetMap(), CurrentMapInstance.Sequence, *Actor->GetName(), WordCount);
 		}
 		else if (StartClass->IsChildOf(UActorComponent::StaticClass()))
 		{
-			if (FObjectActorPair ParentPair = FindObjectPair(SharedMode::ObjectChild::GetParent(Obj)); ParentPair.Actor)
+			if (FFusionObjectActorPair ParentPair = FindObjectPair(FusionCore::ObjectChild::GetParent(Obj)); ParentPair.Actor)
 			{
 				FUSION_LOG("Getting Parent Object: %s", *ParentPair.Actor->GetName());
 				
-				if (TStrongObjectPtr<UTypeDescriptor> SubType = Lookup->HashToDescriptor.FindRef(Obj->Type.Hash))
+				if (TStrongObjectPtr<UFusionTypeDescriptor> SubType = Lookup->HashToDescriptor.FindRef(Obj->Type.Hash))
 				{
-					SharedMode::ObjectChild* ObjChild = SharedMode::ObjectChild::Cast(Obj);
+					FusionCore::ObjectChild* ObjChild = FusionCore::ObjectChild::Cast(Obj);
 
 					//Ensure we fetch the correct component, since multiple of the same type can exist on the actor.
 					UActorComponent* FoundComponent{nullptr};
@@ -2449,7 +2661,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 						FString SubObjectName = Component->GetName();
 						const uint32 SubObjectHash = UFusionHelpers::SafeObjectNameHash(TCHAR_TO_ANSI(*SubObjectName), SubObjectName.Len());
 
-						if (SubObjectHash == ObjChild->TargetObjectHash) {
+						if (SubObjectHash == ObjChild->EngineHash) {
 							FoundComponent = Component;
 							break;
 						}
@@ -2464,7 +2676,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 					
 					if (FoundComponent)
 					{
-						FObjectActorPair Pair = RegisterObject(nullptr, ParentPair.Actor, FoundComponent, Obj, EObjectPairType::Component);
+						FFusionObjectActorPair Pair = RegisterObject(nullptr, ParentPair.Actor, FoundComponent, Obj, EFusionObjectPairType::Component);
 						
 						UFusionActorComponent* ActorSettings = ParentPair.Actor->GetComponentByClass<UFusionActorComponent>();
 
@@ -2513,7 +2725,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 		}
 		else
 		{
-			SharedMode::ObjectId ParentId = SharedMode::ObjectId(SharedMode::ObjectChild::GetParent(Obj));
+			FusionCore::ObjectId ParentId = FusionCore::ObjectId(FusionCore::ObjectChild::GetParent(Obj));
 
 			if (UObject* ParentObject = FindObject(ParentId)) {
 				FUSION_LOG("Getting Parent Object: %s", *ParentObject->GetName());
@@ -2522,7 +2734,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 				{
 					FUSION_LOG("Created New Custom Object: %s", *CreatedObject->GetName());
 					
-					FObjectActorPair Pair = RegisterObject(nullptr, Cast<AActor>(ParentObject), CreatedObject, Obj, EObjectPairType::CustomObject);
+					FFusionObjectActorPair Pair = RegisterObject(nullptr, Cast<AActor>(ParentObject), CreatedObject, Obj, EFusionObjectPairType::CustomObject);
 
 					FCopyContext Context
 					{
@@ -2544,7 +2756,7 @@ bool UFusionClient::OnObjectCreatedFinalize(SharedMode::Object* Obj)
 	return true;
 }
 
-UObject* UFusionClient::RemoveObjectPairs(const SharedMode::ObjectId Id)
+UObject* UFusionClient::RemoveObjectPairs(const FusionCore::ObjectId Id)
 {
 	UObject* Object = FindObject(Id);
 
@@ -2558,7 +2770,7 @@ UObject* UFusionClient::RemoveObjectPairs(const SharedMode::ObjectId Id)
 	ObjectIdToPair.Remove(Id);
 	TempObjectIdToPair.Remove(Id);
 
-	if (SharedMode::ObjectRoot* Root = SharedMode::ObjectRoot::Cast(Client->FindObject(Id)))
+	if (FusionCore::ObjectRoot* Root = FusionCore::ObjectRoot::Cast(Client->FindObject(Id)))
 	{
 		NewRemoteObjectRoots.Remove(Root);
 	}
@@ -2566,22 +2778,22 @@ UObject* UFusionClient::RemoveObjectPairs(const SharedMode::ObjectId Id)
 	return Object;
 }
 
-UObject* UFusionClient::RemoveObjectRoot(const SharedMode::ObjectRoot* Root)
+UObject* UFusionClient::RemoveObjectRoot(const FusionCore::ObjectRoot* Root)
 {
 	if (!Root)
 		return nullptr;
 
-	NewRemoteObjectRoots.Remove(const_cast<SharedMode::ObjectRoot*>(Root));
+	NewRemoteObjectRoots.Remove(const_cast<FusionCore::ObjectRoot*>(Root));
 	
 	return RemoveObjectPairs(Root->Id);
 }
 
-void UFusionClient::OnSubObjectDestroyed(SharedMode::ObjectChild* Obj, const SharedMode::DestroyModes Mode)
+void UFusionClient::OnSubObjectDestroyed(FusionCore::ObjectChild* Obj, const FusionCore::DestroyModes Mode)
 {
 	NewRemoteObjectChildren.Remove(Obj);
 	if (UObject* Object = RemoveObjectPairs(Obj->Id))
 	{
-		if (Mode == SharedMode::DestroyModes::Remote || Mode == SharedMode::DestroyModes::Shutdown || Mode == SharedMode::DestroyModes::SceneChange)
+		if (Mode == FusionCore::DestroyModes::Remote || Mode == FusionCore::DestroyModes::Shutdown || Mode == FusionCore::DestroyModes::MapChange)
 		{
 			if (UActorComponent* Component = Cast<UActorComponent>(Object))
 			{
@@ -2591,46 +2803,44 @@ void UFusionClient::OnSubObjectDestroyed(SharedMode::ObjectChild* Obj, const Sha
 	}
 }
 
-void UFusionClient::OnObjectDestroyed(const SharedMode::ObjectRoot* Obj, const SharedMode::DestroyModes Mode)
+void UFusionClient::OnObjectDestroyed(const FusionCore::ObjectRoot* Obj, const FusionCore::DestroyModes Mode)
 {
-	if (Obj &&  (Obj->SpecialFlags & SharedMode::ObjectSpecialFlags::SceneObject) != SharedMode::ObjectSpecialFlags::None)
+	if (Obj && (Obj->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::SceneObject)) != 0)
 	{
-		OnMapActorDestroyedRemote(Obj->Scene, Obj->Id, Mode);
+		OnMapActorDestroyedRemote(Obj->GetMap(), Obj->Id, Mode);
 	}
 	else
 	{
-		if (Mode == SharedMode::DestroyModes::Remote || Mode == SharedMode::DestroyModes::Shutdown || Mode == SharedMode::DestroyModes::SceneChange)
+		if (Mode == FusionCore::DestroyModes::Remote || Mode == FusionCore::DestroyModes::Shutdown || Mode == FusionCore::DestroyModes::MapChange)
 		{
-			bBlockNextDestroy = true;
-
-			FObjectActorPair Pair = FindObjectPair(Obj->Id);
+			FFusionObjectActorPair Pair = FindObjectPair(Obj->Id);
 			if (Pair.Actor)
 			{
+				//will hit OnEngineObjectDestroyed, ensure we ignore that path when remote destroying.
+				RemoteDestroyedObjects.Add(Pair.Actor);
+				
 				Pair.Settings.Get()->OnObjectDestroyed.Broadcast(ToUnrealDestroyMode(Mode));
 				Pair.Actor->Destroy(true);
 			}
 			RemoveObjectRoot(Obj);
-
-			bBlockNextDestroy = false;
 		}
 	}
 }
 
-void UFusionClient::OnMapActorDestroyedRemote(uint32 SceneSequence, const SharedMode::ObjectId Id, const SharedMode::DestroyModes Mode)
+void UFusionClient::OnMapActorDestroyedRemote(uint32 SceneSequence, const FusionCore::ObjectId Id, const FusionCore::DestroyModes Mode)
 {
-	FObjectActorPair Pair = FindObjectPair(Id);
+	FFusionObjectActorPair Pair = FindObjectPair(Id);
 	
 	if (Pair.IsValid())
 	{
-		bBlockNextDestroy = true;
-
 		if (Pair.Actor)
 		{
+			//will hit OnEngineObjectDestroyed, ensure we ignore that path when remote destroying.
+			RemoteDestroyedObjects.Add(Pair.Actor);
+		
 			Pair.Settings.Get()->OnObjectDestroyed.Broadcast(ToUnrealDestroyMode(Mode));
 			Pair.Actor->Destroy(true);
 		}
-
-		bBlockNextDestroy = false;
 	}
 	else 
 	{
@@ -2648,64 +2858,131 @@ void UFusionClient::OnMapActorDestroyedRemote(uint32 SceneSequence, const Shared
 	RemoveObjectPairs(Id);
 }
 
-void UFusionClient::OnSceneChange([[maybe_unused]] uint32 Index, const uint32 Sequence, const SharedMode::Data Data)
+void UFusionClient::OnFusionStart()
 {
-	if (CurrentMapInstance.Sequence >= Sequence)
+	//This object will live as long as the room exists. Not tied to any map.
+	FPendingObject Pending;
+	Pending.Object = CurrentWorld.IsValid() ? UGameplayStatics::GetGameInstance(CurrentWorld.Get()) : nullptr;
+	if (Pending.Object)
 	{
-		// The current map we have loaded is from further in the future than this requested map change.
-		// So ignore it as we are already more up to date than this request.
-		return;
-	}
-
-	const FString PayloadString = FString::ConstructFromPtrSize(reinterpret_cast<char*>(Data.Ptr), Data.Length);
-
-	TSharedPtr<FJsonObject> JsonObject;
-	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(PayloadString);
-	FJsonSerializer::Deserialize(Reader, JsonObject);
-
-	FString LevelNameCopy;
-	bool bAttachCurrent;
-	if (JsonObject.IsValid())
-	{
-		LevelNameCopy = JsonObject->GetStringField(TEXT("MapName"));
-		bAttachCurrent = JsonObject->GetBoolField(TEXT("Attached"));
+		PendingObjects.Add(Pending);
 	}
 	else
 	{
-		FUSION_LOG_ERROR("UFusionClient::OnSceneChange Received invalid payload string: %s", *PayloadString);
-		return;
+		FUSION_LOG_ERROR("Invalid world or GameInstance on room join");
 	}
-
-	FMapInstance RequestedMapInstance;
-	RequestedMapInstance.Name = LevelNameCopy;
-	RequestedMapInstance.Sequence = Sequence;
-	RequestedMapInstance.bAttachCurrent = bAttachCurrent;
-	
-	RequestedMapInstances.HeapPush(RequestedMapInstance);
-
-	if (!bAttachCurrent)
-	{
-		//Since potential destroy calls for objects can start happening after this has fired we need to ensure we are no longer on LevelActive trying to iterate things.
-		SetMapState(EMapState::HasRequestToChangeLevel);
-	}
-
-	FUSION_LOG("Wanted Map Name: %s, total number of maps to load: %i", *LevelNameCopy, RequestedMapInstances.Num());
 }
 
-auto UFusionClient::OnRpcReceived(const SharedMode::Rpc& Rpc) -> void
+void UFusionClient::OnMapChange(const std::unordered_map<FusionCore::Map, FusionCore::Data> &Maps, bool Initial)
 {
-	//UE_LOG(LogTemp, Warning, TEXT("Received RPC id: %llu   ClientId: %s"), Rpc.Id, *ClientInstanceId.ToString());
+	FUSION_LOG("Fusion OnMapChange Initial=%d Maps.size=%d ClientType=%s",
+		Initial ? 1 : 0,
+		(int)Maps.size(),
+		*UEnum::GetValueAsString(ClientInstanceType));
+
+	if (Client->IsMasterClient())
+	{
+		//This will be called from Client->Start on initial mapload, will be in same callstack.
+		if (Initial)
+		{
+			auto Pair = Maps.find(1);
+			if (Pair != Maps.end())
+			{
+				const FString PayloadString = FString::ConstructFromPtrSize(reinterpret_cast<char*>(Pair->second.Ptr), Pair->second.Length);
+				TSharedPtr<FJsonObject> JsonObject = UFusionHelpers::DeserializeMapPayload(PayloadString);
+				
+				if (JsonObject.IsValid())
+				{
+					FString InitialWorldName = JsonObject->GetStringField(TEXT("MapName"));
+					ChangeWorld(InitialWorldName);
+				}
+				else
+				{
+					FUSION_LOG_ERROR("UFusionClient::OnMapChange Received invalid payload string: %s", *PayloadString);
+					return;
+				}
+			}
+
+		}
+		return;
+	}
 	
+	for (const auto &[MapSequence, Data] : Maps)
+	{
+		if (MapSequence == 0 || Data.Length == 0)
+		{
+			continue;
+		}
+
+		const FString PayloadString = FString::ConstructFromPtrSize(reinterpret_cast<char*>(Data.Ptr), Data.Length);
+		TSharedPtr<FJsonObject> JsonObject = UFusionHelpers::DeserializeMapPayload(PayloadString);
+
+		FString LevelNameCopy;
+		bool bAttachCurrent;
+		if (JsonObject.IsValid())
+		{
+			LevelNameCopy = JsonObject->GetStringField(TEXT("MapName"));
+			bAttachCurrent = JsonObject->GetBoolField(TEXT("Attached"));
+		}
+		else
+		{
+			FUSION_LOG_ERROR("UFusionClient::OnSceneChange Received invalid payload string: %s", *PayloadString);
+			return;
+		}
+		
+		if (bAttachCurrent)
+		{
+			FString TargetMapName = FPackageName::GetShortName(LevelNameCopy);
+			
+			FString WorldName = CurrentWorld->GetName();
+			FString CleanedName = UWorld::RemovePIEPrefix(WorldName);
+
+			//Ensure we can only attach if the requested map is the current active one.
+			if (CleanedName == TargetMapName)
+			{
+				//Attach map will not force any load, its local clients job to be on the correct world.
+				CurrentMapInstance.Name = LevelNameCopy;
+				CurrentMapInstance.Sequence = MapSequence;
+				CurrentMapInstance.bAttachCurrent = true;
+
+				TargetMapInstance.Name = TargetMapName;
+
+				//Assume masterclient can directly connect all things in the active world.
+				AttachCurrentMap_Internal(CurrentWorld.Get());
+
+				//This will not work with additive map loads, need to fix later.
+				return;
+			}
+		}
+
+		FMapInstance RequestedMapInstance;
+		RequestedMapInstance.Name = LevelNameCopy;
+		RequestedMapInstance.Sequence = MapSequence;
+		RequestedMapInstance.bAttachCurrent = false;
+
+		//Will later be consumed in TriggerMapLoad called from Tick.
+		RequestedMapInstances.HeapPush(RequestedMapInstance);
+		
+		//Since potential destroy calls for objects can start happening after this has fired we need to ensure we are no longer on LevelActive trying to iterate things.
+		SetMapState(EMapState::HasRequestToChangeLevel);
+		
+		FUSION_LOG("Wanted Map Name: %s, total number of maps to load: %i", *LevelNameCopy, RequestedMapInstances.Num());
+	}
+}
+
+auto UFusionClient::OnRpcReceived(const FusionCore::Rpc& Rpc) -> void
+{
 	if (Rpc.TargetObject.IsSome())
 	{
-		if (UObject* Object = FindObject(Rpc.TargetObject))
+		FFusionObjectActorPair Pair = FindObjectPair(Rpc.TargetObject);
+		if (Pair.IsValid())
 		{
-			if (const TStrongObjectPtr<UTypeDescriptor> Desc = Lookup->HashToDescriptor.FindRef(Rpc.DescriptorTypeHash))
+			if (const auto Desc = Lookup->FindClassDescriptor(Pair.EngineObject.GetClass()))
 			{
 				if (const FString* EventNamePtr = Desc->EventHashToName.Find(Rpc.EventHash))
 				{
 					const FString EventName = *EventNamePtr;
-					UFunctionDescriptor* FunctionDescriptor = *Desc->EventFunctions.Find(EventName);
+					UFusionFunctionDescriptor* FunctionDescriptor = *Desc->EventFunctions.Find(EventName);
 	
 					void* Params = FMemory_Alloca(FunctionDescriptor->ParametersSize);
 					FunctionDescriptor->DeserializeParams(this, Rpc, Params);
@@ -2723,7 +3000,7 @@ auto UFusionClient::OnRpcReceived(const SharedMode::Rpc& Rpc) -> void
 						}
 					}
 
-					Object->ProcessEvent(FunctionDescriptor->Function, Params);
+					Pair.EngineObject->ProcessEvent(FunctionDescriptor->Function, Params);
 
 					if (PlayerController && FusionNetDriver)
 					{
@@ -2737,22 +3014,22 @@ auto UFusionClient::OnRpcReceived(const SharedMode::Rpc& Rpc) -> void
 				}
 				else
 				{
-					FUSION_LOG_WARN("RPC EventHash: %llu not found, ensure source type has correct event output", Rpc.EventHash);
+					FUSION_LOG_WARN("OnRpcReceived: RPC EventHash: %llu not found, ensure source type has correct event output", Rpc.EventHash);
 				}
 			}
 			else
 			{
-				FUSION_LOG_WARN("RPC Descriptor with hash: %llu not found, make sure the type sending the RPC is among mapped types.", Rpc.DescriptorTypeHash);
+				FUSION_LOG_WARN("OnRpcReceived: Unable to find or create descriptor for type: %s", *Pair.EngineObject.GetClass()->GetName());
 			}
 		}
 		else
 		{
-			FUSION_LOG_WARN("RPC target object: %s not found", *ObjectIdToString(Rpc.TargetObject));
+			FUSION_LOG_WARN("OnRpcReceived: target object: %s not found", *ObjectIdToString(Rpc.TargetObject));
 		}
 	}
 	else
 	{
-		FUSION_LOG_WARN("RPC TargetObject not set");
+		FUSION_LOG_WARN("OnRpcReceived: RPC TargetObject not set");
 	}
 }
 
@@ -2764,6 +3041,11 @@ bool UFusionClient::IsLoadingMap()
 void UFusionClient::OnMapInit(UWorld* World)
 {
 	CurrentWorld = World;
+	
+	ApplyFusionStreamingSkipFlags(World);
+	
+	OnActorSpawnedHandle = CurrentWorld->AddOnActorSpawnedHandler(FOnActorSpawned::FDelegate::CreateUObject(this, &UFusionClient::OnActorSpawned));
+	OnActorDestroyedHandle = CurrentWorld->AddOnActorDestroyedHandler(FOnActorSpawned::FDelegate::CreateUObject(this, &UFusionClient::OnEngineObjectDestroyed));
 
 	FUSION_LOG("UFusionClient::OnMapInit(%s)  LoadedWorldIndex: %d  Name: %s   ClientId: %s", *UEnum::GetValueAsString(ClientInstanceType), World->GetUniqueID(), *World->GetName(), *ClientInstanceId.ToString());
 }
@@ -2773,6 +3055,22 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 	if (World != CurrentWorld)
 	{
 		return;
+	}
+
+	if (OnActorSpawnedHandle.IsValid())
+	{
+		CurrentWorld->RemoveOnActorSpawnedHandler(OnActorSpawnedHandle);
+		OnActorSpawnedHandle.Reset();
+	}
+	
+	if (OnActorDestroyedHandle.IsValid())
+	{
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+		CurrentWorld->RemoveOnActorDestroyededHandler(OnActorDestroyedHandle);
+#else
+		CurrentWorld->RemoveOnActorDestroyedHandler(OnActorDestroyedHandle);
+#endif
+		OnActorDestroyedHandle.Reset();
 	}
 	
 	DependencyChecks.Empty();
@@ -2800,7 +3098,7 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 	TArray<AActor*> RemoteActors;
 	for (auto It = ObjectIdToPair.CreateIterator(); It; ++It)
 	{
-		const FObjectActorPair& Pair = It->Value;
+		const FFusionObjectActorPair& Pair = It->Value;
 		
 		if (!Client->FindObject(Pair.ObjectId))
 		{
@@ -2816,7 +3114,7 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 			continue;
 		}
 
-		SharedMode::ObjectRoot* Root = Pair.Object->Root();
+		FusionCore::ObjectRoot* Root = Pair.Object->Root();
 
 		if (!Root)
 		{
@@ -2825,8 +3123,8 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 			continue;
 		}
 
-		FObjectActorPair RootPair = FindObjectPair(Root->Id);
-		if (RootPair.Actor &&  (Pair.Object->SpecialFlags & SharedMode::ObjectSpecialFlags::SceneObject) == SharedMode::ObjectSpecialFlags::None)
+		FFusionObjectActorPair RootPair = FindObjectPair(Root->Id);
+		if (RootPair.Actor && (Pair.Object->EngineFlags & static_cast<uint32_t>(EObjectSpecialFlags::SceneObject)) == 0)
 		{
 			//Do no destroy proxies. Should be handled in OnObjectDestroy
 			if (RootPair.Actor->GetLocalRole() == ROLE_SimulatedProxy)
@@ -2835,13 +3133,13 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 			}
 		}
 
-		if (Root && Root->Scene == 0)
+		if (Root && Root->GetMap() == 0)
 		{
 			//These object have custom lifecycles, dont remove when map changes.
 			continue;
 		}
 		
-		if (Root && Root->Scene < CurrentMapInstance.Sequence)
+		if (Root && Root->GetMap() < CurrentMapInstance.Sequence)
 		{
 			ObjectToObjectId.Remove(Pair.EngineObject);
 			It.RemoveCurrent();
@@ -2850,7 +3148,7 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 
 	for (auto It = TempObjectIdToPair.CreateIterator(); It; ++It)
 	{
-		const FObjectActorPair& Pair = It->Value;
+		const FFusionObjectActorPair& Pair = It->Value;
 		
 		if (!Client->FindObject(Pair.ObjectId))
 		{
@@ -2866,13 +3164,13 @@ void UFusionClient::OnMapDestroy(UWorld* World)
 			continue;
 		}
 		
-		SharedMode::ObjectRoot* Root = Pair.Object->Root();
-		if (Root && Root->Scene == 0)
+		FusionCore::ObjectRoot* Root = Pair.Object->Root();
+		if (Root && Root->GetMap() == 0)
 		{
 			continue;
 		}
 		
-		if (Root && Root->Scene < CurrentMapInstance.Sequence)
+		if (Root && Root->GetMap() < CurrentMapInstance.Sequence)
 		{
 			TempObjectToObjectId.Remove(Pair.EngineObject);
 			It.RemoveCurrent();
@@ -2942,6 +3240,8 @@ void UFusionClient::PostMapLoad(UWorld* LoadedWorld)
 {
 	FUSION_LOG("Map has finished loading. Maps still to load: %i", RequestedMapInstances.Num());
 
+	ApplyFusionStreamingSkipFlags(LoadedWorld);
+
 	// ReSharper disable once CppDeclaratorNeverUsed
 	FusionPhysicsReplication* PhysicsReplication = FusionPhysicsUtils::CreateReplicationSetup(LoadedWorld);
 	check(PhysicsReplication);
@@ -2972,6 +3272,16 @@ void UFusionClient::PostMapLoad(UWorld* LoadedWorld)
 	RetrieveSocketFromBackgroundThread();
 
 	SetupNetDriver(LoadedWorld);
+}
+
+void UFusionClient::OnLevelAdded(ULevel* Level, UWorld* World)
+{
+	ApplyFusionStreamingSkipFlags(World);
+}
+
+void UFusionClient::OnLevelRemoved(ULevel* Level, UWorld* World)
+{
+	//No-op for now.
 }
 
 void UFusionClient::SetupNetDriver(UWorld* World)
@@ -3022,7 +3332,7 @@ void UFusionClient::SendSocketToBackgroundThread()
 	
 	bSocketInBgThread = true;
 
-	SharedMode::Client* Client2 = this->Client;
+	FusionCore::Client* Client2 = this->Client;
 
 	std::atomic_bool* Mtr = &MainThreadReady;
 	std::atomic_bool* Btd = &BackThreadDone;
@@ -3133,19 +3443,23 @@ bool UFusionClient::IsTargetWorld(UWorld* World)
 void UFusionClient::ToggleNetworkSend(UFusionActorComponent* FusionActorSettings, bool bToggle)
 {
 	AActor* Owner = FusionActorSettings->GetOwner();
-	if (SharedMode::Object* Obj = FindObject(Owner))
+	if (FusionCore::Object* Obj = FindObject(Owner))
 	{
 		Obj->SetSendUpdates(bToggle);
 	}
 }
 
-void UFusionClient::Startup(UWorld* InitialWorld, UTypeLookup* TypeLookup, const UPhotonOnlineSubsystemSettings* Settings, PhotonMatchmaking::RealtimeClient& RealtimeClient)
+void UFusionClient::Startup(UWorld* InitialWorld, UFusionTypeLookup* TypeLookup, const UFusionOnlineSubsystemSettings* Settings, TObjectPtr<UFusionRealtimeClient> FusionRealtimeClient)
 {
 	check (InitialWorld);
 	check (TypeLookup);
 
-	Client = new SharedMode::Client(RealtimeClient);
-
+	RealtimeClient = FusionRealtimeClient;
+	
+	auto& MatchmakingClient = *RealtimeClient->GetClient();
+	auto Room = MatchmakingClient.GetCurrentRoom();
+		
+	Client = new FusionCore::Client(MatchmakingClient);
 	CurrentWorld = InitialWorld;
 	Lookup = TypeLookup;
 	
@@ -3159,9 +3473,12 @@ void UFusionClient::Startup(UWorld* InitialWorld, UTypeLookup* TypeLookup, const
 	DriverName = FString::Printf(TEXT("FusionNetDriver-%s"), *ClientInstanceId.ToString());
 
 #if WITH_EDITOR
-	const ULevelEditorPlaySettings* PlayInSettings = GetMutableDefault<ULevelEditorPlaySettings>();
-	check(PlayInSettings);
-	PlayInSettings->GetRunUnderOneProcess(bRunUnderOneProcess);
+	if (GIsEditor)
+	{
+		const ULevelEditorPlaySettings* PlayInSettings = GetMutableDefault<ULevelEditorPlaySettings>();
+		check(PlayInSettings);
+		PlayInSettings->GetRunUnderOneProcess(bRunUnderOneProcess);
+	}
 #endif
 	
 	FUSION_LOG("Made Client Instance with Id: %s  Type: %s  InitialWorld: %s", *ClientInstanceId.ToString(), *UEnum::GetValueAsString(ClientInstanceType), *CurrentWorld->GetName());
@@ -3171,54 +3488,44 @@ void UFusionClient::Startup(UWorld* InitialWorld, UTypeLookup* TypeLookup, const
 			this->OnForcedDisconnect(FString(UTF8_TO_TCHAR(message.c_str())));
 		});
 
-	ClientSubscriptionBag += Client->OnObjectReady.Subscribe([this](SharedMode::ObjectRoot* Obj)
+	ClientSubscriptionBag += Client->OnObjectReady.Subscribe([this](FusionCore::ObjectRoot* Obj)
 	{
 		this->OnObjectReady(Obj);
 	});
 
-	ClientSubscriptionBag += Client->OnSubObjectCreated.Subscribe( [this](SharedMode::ObjectChild* Obj)
+	ClientSubscriptionBag += Client->OnSubObjectCreated.Subscribe( [this](FusionCore::ObjectChild* Obj)
 	{
 		this->OnSubObjectCreated(Obj);
 	});
 
-	ClientSubscriptionBag += Client->OnSubObjectDestroyed.Subscribe( [this](SharedMode::ObjectChild* Obj, const SharedMode::DestroyModes Mode)
+	ClientSubscriptionBag += Client->OnSubObjectDestroyed.Subscribe( [this](FusionCore::ObjectChild* Obj, const FusionCore::DestroyModes Mode)
 	{
 		this->OnSubObjectDestroyed(Obj, Mode);
 	});
 
-	ClientSubscriptionBag += Client->OnObjectDestroyed.Subscribe( [this](const SharedMode::ObjectRoot* Obj, const SharedMode::DestroyModes Mode)
+	ClientSubscriptionBag += Client->OnObjectDestroyed.Subscribe( [this](const FusionCore::ObjectRoot* Obj, const FusionCore::DestroyModes Mode)
 	{
 		this->OnObjectDestroyed(Obj, Mode);
 	});
 
-	ClientSubscriptionBag += Client->OnSceneChange.Subscribe( [this](const uint32_t Index, const uint32_t Sequence, const SharedMode::Data& Scene)
+	ClientSubscriptionBag += Client->OnMapChange.Subscribe( [this](const std::unordered_map<FusionCore::Map, FusionCore::Data>& Maps, bool Initial)
 	{
-		this->OnSceneChange(Index, Sequence, Scene);
+		this->OnMapChange(Maps, Initial);
 	});
 
-	ClientSubscriptionBag += Client->OnRpc.Subscribe([this](const SharedMode::Rpc& RPC)
+	ClientSubscriptionBag += Client->OnRpc.Subscribe([this](const FusionCore::Rpc& RPC)
 	{
 		this->OnRpcReceived(RPC);
 	});
 
-	ClientSubscriptionBag += Client->OnDestroyedMapActor.Subscribe([this](uint32 SceneSequence, const SharedMode::ObjectId Id)
+	ClientSubscriptionBag += Client->OnDestroyedMapActor.Subscribe([this](const FusionCore::ObjectId Id)
 	{
-		this->OnMapActorDestroyedRemote(SceneSequence, Id, SharedMode::DestroyModes::Remote);
+		this->OnMapActorDestroyedRemote(Id.Map, Id, FusionCore::DestroyModes::Remote);
 	});
 
 	ClientSubscriptionBag += Client->OnFusionStart.Subscribe([this]()
 	{
-		//This object will live as long as the room exists. Not tied to any map.
-		FPendingObject Pending;
-		Pending.Object = CurrentWorld.IsValid() ? UGameplayStatics::GetGameInstance(CurrentWorld.Get()) : nullptr;
-		if (Pending.Object)
-		{
-			PendingObjects.Add(Pending);
-		}
-		else
-		{
-			FUSION_LOG_ERROR("Invalid world or GameInstance on room join");
-		}
+		this->OnFusionStart();
 	});
 
 	Client->Start();
@@ -3228,6 +3535,8 @@ void UFusionClient::Shutdown()
 {
 	SetMapState(EMapState::Shutdown);
 
+	RealtimeClient = nullptr;
+	
 	ClientSubscriptionBag.UnsubscribeAll();
 	
 	Client->Stop();
@@ -3244,11 +3553,14 @@ void UFusionClient::Shutdown()
 		FusionNetDriver->Cleanup();
 		GEngine->DestroyNamedNetDriver(CurrentWorld.Get(), FName(DriverName));
 	}
+	
 	if (CurrentWorld.IsValid())
 	{
 		CurrentWorld->SetNetDriver(nullptr);
+
+		FusionPhysicsUtils::ResetReplication(CurrentWorld.Get());
 	}
-	
+
 	FusionNetDriver = nullptr;
 	CurrentWorld = nullptr;
 	Lookup = nullptr;

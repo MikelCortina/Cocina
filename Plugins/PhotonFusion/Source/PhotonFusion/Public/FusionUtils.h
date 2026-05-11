@@ -6,6 +6,6 @@
 #include "Fusion/Aliases.h"
 
 uint64 HashFString(const FString& String);
-PHOTONFUSION_API FString ObjectIdToString(SharedMode::ObjectId Id);
+PHOTONFUSION_API FString ObjectIdToString(FusionCore::ObjectId Id);
 uint32 Crc32(const uint8* Buffer, uint32 Len);
 

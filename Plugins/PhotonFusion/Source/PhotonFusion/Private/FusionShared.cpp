@@ -4,6 +4,9 @@
 
 #include "Developer/Settings/Public/ISettingsModule.h"
 #include "FusionClient.h"
+#include "FusionOnlineSubsystemSettings.h"
+#include "Logging/FusionStandardLogOutput.h"
+#include "Logging/FusionOnScreenDebugMessageLogOutput.h"
 
 #if WITH_EDITOR
 #include "Editor.h"
@@ -25,6 +28,24 @@ void FPhotonFusion::StartupModule()
 	FEditorDelegates::BeginPIE.AddRaw(this, &FPhotonFusion::OnBeginPIE);
 	FEditorDelegates::EndPIE.AddRaw(this, &FPhotonFusion::OnEndPIE);
 #endif
+
+	const UFusionOnlineSubsystemSettings* Settings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();
+
+	if (Settings->EnabledLogOutput & StaticCast<uint8>(EFusionLogOutput::StandardLogOutput))
+	{
+		FusionStandardLogOutput* LogOutput = new FusionStandardLogOutput();
+		LogOutputArr.Add(LogOutput);
+		PhotonCommon::AddLogOutput(LogOutput);
+	}
+
+	if (Settings->EnabledLogOutput & StaticCast<uint8>(EFusionLogOutput::OnScreenDebugMessageLogOutput))
+	{
+		FusionOnScreenDebugMessageLogOutput* LogOutput = new FusionOnScreenDebugMessageLogOutput();
+		LogOutputArr.Add(LogOutput);
+		PhotonCommon::AddLogOutput(LogOutput);
+	}
+
+	PhotonCommon::SetLogLevelsFromBitmask(Settings->EnabledLogLevels);
 }
 
 void FPhotonFusion::ShutdownModule()
@@ -33,6 +54,16 @@ void FPhotonFusion::ShutdownModule()
 	FEditorDelegates::BeginPIE.RemoveAll(this);
 	FEditorDelegates::EndPIE.RemoveAll(this);
 #endif
+
+	for (PhotonCommon::LogOutput* LogOutput : LogOutputArr)
+	{
+		if (!PhotonCommon::RemoveLogOutput(LogOutput))
+		{
+			UE_LOG(LogFusion, Error, TEXT("Error removing Fusion log output"));
+		}
+		delete LogOutput;
+	}
+	LogOutputArr.Empty();
 }
 
 void FPhotonFusion::OnBeginPIE([[maybe_unused]] bool bArg)

@@ -51,8 +51,8 @@ public:
 	void CleanupCompletedTasks();
 
 	// Task storage (moved from subsystem)
-	std::vector<PhotonMatchmaking::Task<PhotonMatchmaking::Result<void>>> PendingVoidTasks;
-	std::vector<PhotonMatchmaking::Task<PhotonMatchmaking::Result<PhotonMatchmaking::MutableRoomView>>> PendingRoomTasks;
+	std::vector<PhotonCommon::Task<PhotonCommon::Result<void, PhotonMatchmaking::ErrorCode>>> PendingVoidTasks;
+	std::vector<PhotonCommon::Task<PhotonCommon::Result<PhotonMatchmaking::MutableRoomView, PhotonMatchmaking::ErrorCode>>> PendingRoomTasks;
 
 	virtual void BeginDestroy() override;
 

@@ -71,7 +71,7 @@
     <!-- UE 5.5+ requires .NET 8 SDK -->
     <WriteLinesToFile
       File="$(_GlobalJsonPath)"
-      Lines='{ "sdk": { "version": "8.0.100", "rollForward": "latestFeature" } }'
+      Lines='{ "sdk": { "version": "9.0.0", "rollForward": "latestFeature" } }'
       Overwrite="true"
       Condition="'$(_IsNet6Engine)' != 'true'" />
   </Target>

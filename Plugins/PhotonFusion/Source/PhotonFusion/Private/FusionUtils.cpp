@@ -12,13 +12,13 @@ uint64 HashFString(const FString& String)
 
 	for (auto It = String.CreateConstIterator(); It; ++It)
 	{
-		CRC = SharedMode::CRC64(CRC, *It);
+		CRC = FusionCore::CRC64(CRC, *It);
 	}
 
 	return CRC;
 }
 
-FString ObjectIdToString(const SharedMode::ObjectId Id)
+FString ObjectIdToString(const FusionCore::ObjectId Id)
 {
 	return FString::Format(TEXT("[{0}:{1} ]"), FStringFormatOrderedArguments{Id.Origin, Id.Counter});
 }

@@ -66,9 +66,10 @@ void UFusionSpatialHashInterestComponent::EndPlay(const EEndPlayReason::Type Rea
 	{
 		if (UFusionClient* FusionClient = Subsystem->GetFusionClient())
 		{
-			if (SharedMode::Client* Client = FusionClient->GetClient())
+			if (FusionCore::Client* Client = FusionClient->GetClient())
 			{
-				Client->ClearAreaKeys();
+				Client->GetLocalInterestKeys().ClearAreaKeys();
+				//Client->ClearAreaKeys();
 			}
 			FusionClient->UpdateOwnedActorAreaInterestKeys([](const AActor*) -> uint64 { return 0; });
 		}
@@ -93,12 +94,12 @@ void UFusionSpatialHashInterestComponent::TickComponent(float DeltaTime, ELevelT
 	UFusionClient* FusionClient = Subsystem->GetFusionClient();
 	if (!FusionClient) return;
 
-	SharedMode::Client* Client = FusionClient->GetClient();
+	FusionCore::Client* Client = FusionClient->GetClient();
 	if (!Client) return;
 
 	if (!bEnabled)
 	{
-		Client->ClearAreaKeys();
+		Client->GetLocalInterestKeys().ClearAreaKeys();
 		FusionClient->UpdateOwnedActorAreaInterestKeys([](const AActor*) -> uint64 { return 0; });
 		return;
 	}
@@ -132,8 +133,7 @@ void UFusionSpatialHashInterestComponent::TickComponent(float DeltaTime, ELevelT
 
 			Keys.emplace_back(Key, uint8_t(0));
 		}
-
-		Client->SetAreaKeys(Keys);
+		Client->GetLocalInterestKeys().SetAreaKeys(Keys);
 	}
 
 	// --- Publisher side: assign area interest keys to all locally-owned root actors ---

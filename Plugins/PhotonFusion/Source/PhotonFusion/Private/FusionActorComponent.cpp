@@ -14,7 +14,7 @@
 #include "Components/InputComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Physics/FusionPhysicsUtils.h"
-#include "PhotonOnlineSubsystemSettings.h"
+#include "FusionOnlineSubsystemSettings.h"
 #include "Engine/PackageMapClient.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Pawn.h"
@@ -67,7 +67,7 @@ TYPE UFusionActorComponent::Get ## SETTING() const\
 		return SETTING;\
 	}\
 \
-	const UPhotonOnlineSubsystemSettings* SubSettings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();\
+	const UFusionOnlineSubsystemSettings* SubSettings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();\
 \
 	return SubSettings->SETTING;\
 };\
@@ -105,31 +105,6 @@ void UFusionActorComponent::EndPlay(const EEndPlayReason::Type Reason)
 {
 	Super::EndPlay(Reason);
 	
-	// explicit destroy
-	if (Reason == EEndPlayReason::Type::Destroyed)
-	{
-		const auto OwnerActor = GetOwner();
-		if (const auto Fusion = UGameplayStatics::GetGameInstance(OwnerActor)->GetSubsystem<UFusionOnlineSubsystem>())
-		{
-			if (Fusion->IsFusionRunning())
-			{
-				Fusion->GFusionClient->OnEngineObjectDestroyed(OwnerActor, true);
-			}
-		}
-	}
-
-	// changing map
-	else if (Reason == EEndPlayReason::Type::LevelTransition)
-	{
-		
-	}
-
-	// level streaming
-	else if (Reason == EEndPlayReason::Type::RemovedFromWorld)
-	{
-		
-	}
-
 	RemoveEvents();
 }
 
@@ -185,12 +160,12 @@ void UFusionActorComponent::ToggleNetworkSend(bool bToggle)
 	}
 }
 
-SharedMode::ObjectOwnerModes UFusionActorComponent::GetOwnerMode()
+FusionCore::ObjectOwnerModes UFusionActorComponent::GetOwnerMode()
 {
-	return static_cast<SharedMode::ObjectOwnerModes>(Ownership);
+	return static_cast<FusionCore::ObjectOwnerModes>(Ownership);
 }
 
-SharedMode::ObjectOwnerModes UFusionActorComponent::GetTypes(const UFusionClient* Client, TSet<UActorComponent*> Components, USceneComponent* RootComponent, TArray<FTypeData>& OutTypeData)
+FusionCore::ObjectOwnerModes UFusionActorComponent::GetTypes(const UFusionClient* Client, TSet<UActorComponent*> Components, USceneComponent* RootComponent, TArray<FTypeData>& OutTypeData)
 {
 	AActor* Actor = GetOwner();
 
@@ -204,12 +179,12 @@ SharedMode::ObjectOwnerModes UFusionActorComponent::GetTypes(const UFusionClient
 		bDisableRootTransformUpdates = true;
 	}
 	
-	FPropertyBuildOptions DefaultBuildOptions = UTypeLookup::GetDefaultBuildOptions();
+	FPropertyBuildOptions DefaultBuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
 
-	const UTypeDescriptor* ActorDesc = Client->Lookup->CreateTypeDescriptor(Actor->GetClass(), DefaultBuildOptions);
+	const UFusionTypeDescriptor* ActorDesc = Client->Lookup->CreateTypeDescriptor(Actor->GetClass(), DefaultBuildOptions);
 
 	const FTypeData BaseData{
-		SharedMode::TypeRef{ActorDesc->TypeHash, ActorDesc->WordCount},
+		FusionCore::TypeRef{ActorDesc->TypeHash, ActorDesc->WordCount},
 		Actor
 	};
 	OutTypeData.Add(BaseData);
@@ -224,14 +199,14 @@ SharedMode::ObjectOwnerModes UFusionActorComponent::GetTypes(const UFusionClient
 			continue;
 		}
 		
-		FPropertyBuildOptions ComponentBuildOptions = UTypeLookup::GetDefaultBuildOptions();
-		SharedMode::ObjectSpecialFlags SpecialFlags{};
+		FPropertyBuildOptions ComponentBuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
+		EObjectSpecialFlags SpecialFlags{};
 		if (ActorComponent == RootComponent)
 		{
-			SpecialFlags |= SharedMode::ObjectSpecialFlags::IsRootTransform;
+			SpecialFlags |= EObjectSpecialFlags::IsRootTransform;
 			if (bDisableRootTransformUpdates)
 			{
-				SpecialFlags |= SharedMode::ObjectSpecialFlags::IgnoreRootTransformProperties;
+				SpecialFlags |= EObjectSpecialFlags::IgnoreRootTransformProperties;
 			}
 
 			ComponentBuildOptions.IsRootTransform = true;
@@ -246,11 +221,11 @@ SharedMode::ObjectOwnerModes UFusionActorComponent::GetTypes(const UFusionClient
 			}
 		}
 			
-		if (const UTypeDescriptor* CompDescriptor = Client->Lookup->CreateTypeDescriptor(Cls, ComponentBuildOptions); CompDescriptor) {
+		if (const UFusionTypeDescriptor* CompDescriptor = Client->Lookup->CreateTypeDescriptor(Cls, ComponentBuildOptions); CompDescriptor) {
 			if (ShouldAddComponentType(ActorComponent))
 			{
 				FTypeData SubObjectData{
-					SharedMode::TypeRef{CompDescriptor->TypeHash, CompDescriptor->WordCount},
+					FusionCore::TypeRef{CompDescriptor->TypeHash, CompDescriptor->WordCount},
 					ActorComponent,
 					SpecialFlags
 				};
@@ -300,13 +275,13 @@ void UFusionActorComponent::CheckPhysicsReplication(const UFusionClient* Client,
 		
 		FusionPhysicsUtils::InitiatePhysicsReplication(ReplicationComponent);
 
-		FPropertyBuildOptions BuildOptions = UTypeLookup::GetDefaultBuildOptions();
+		FPropertyBuildOptions BuildOptions = UFusionTypeLookup::GetDefaultBuildOptions();
 		
-		if (const UTypeDescriptor* CompDescriptor = Client->Lookup->CreateTypeDescriptor(
+		if (const UFusionTypeDescriptor* CompDescriptor = Client->Lookup->CreateTypeDescriptor(
 			UFusionPhysicsReplicationComponent::StaticClass(), BuildOptions); CompDescriptor)
 		{
 			FTypeData SubObjectData{
-				SharedMode::TypeRef{CompDescriptor->TypeHash, CompDescriptor->WordCount},
+				FusionCore::TypeRef{CompDescriptor->TypeHash, CompDescriptor->WordCount},
 				ReplicationComponent
 			};
 			OutTypeData.Add(SubObjectData);
@@ -331,11 +306,11 @@ void UFusionActorComponent::RemoveEvents()
 	BridgeSubscriptions.UnsubscribeAll();
 }
 
-void UFusionActorComponent::SubscribeEvents(SharedMode::Client* Client, SharedMode::ObjectId Id)
+void UFusionActorComponent::SubscribeEvents(FusionCore::Client* Client, FusionCore::ObjectId Id)
 {
 	RemoveEvents();
 	
-	BridgeSubscriptions += Client->OnObjectOwnerChanged.Subscribe([this, Id](SharedMode::ObjectRoot* Obj)
+	BridgeSubscriptions += Client->OnObjectOwnerChanged.Subscribe([this, Id](FusionCore::ObjectRoot* Obj)
 	{
 		if (Obj->Id == Id)
 		{
@@ -343,7 +318,7 @@ void UFusionActorComponent::SubscribeEvents(SharedMode::Client* Client, SharedMo
 		}
 	});
 
-	BridgeSubscriptions += Client->OnOwnerWasGiven.Subscribe([this, Id](SharedMode::ObjectRoot* Obj)
+	BridgeSubscriptions += Client->OnObjectOwnerAssigned.Subscribe([this, Id](FusionCore::ObjectRoot* Obj)
 	{
 		if (Obj->Id == Id)
 		{
@@ -351,7 +326,7 @@ void UFusionActorComponent::SubscribeEvents(SharedMode::Client* Client, SharedMo
 		}
 	});
 
-	BridgeSubscriptions += Client->OnInterestEnter.Subscribe([this, Id](SharedMode::ObjectRoot* Obj)
+	BridgeSubscriptions += Client->OnInterestEnter.Subscribe([this, Id](FusionCore::ObjectRoot* Obj)
 	{
 		if (Obj->Id == Id)
 		{
@@ -359,7 +334,7 @@ void UFusionActorComponent::SubscribeEvents(SharedMode::Client* Client, SharedMo
 		}
 	});
 
-	BridgeSubscriptions += Client->OnInterestExit.Subscribe([this, Id](SharedMode::ObjectRoot* Obj)
+	BridgeSubscriptions += Client->OnInterestExit.Subscribe([this, Id](FusionCore::ObjectRoot* Obj)
 	{
 		if (Obj->Id == Id)
 		{
@@ -373,7 +348,7 @@ void UFusionActorComponent::PostEditChangeProperty(FPropertyChangedEvent& Proper
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
-	const UPhotonOnlineSubsystemSettings* SubSystemSettings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
+	const UFusionOnlineSubsystemSettings* SubSystemSettings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();
 
 	if (PropertyChangedEvent.Property)
 	{
@@ -407,7 +382,7 @@ void UFusionActorComponent::PostEditChangeProperty(FPropertyChangedEvent& Proper
 
 void UFusionActorComponent::PostLoad()
 {
-	const UPhotonOnlineSubsystemSettings* SubSystemSettings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
+	const UFusionOnlineSubsystemSettings* SubSystemSettings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();
 
 	// Start of post init property checks that override those found in PhotonOnlineSubsystemSettings.h
 	
@@ -443,7 +418,7 @@ void UFusionActorComponent::PostLoad()
 
 void UFusionActorComponent::PostInitProperties()
 {
-	const UPhotonOnlineSubsystemSettings* SubSystemSettings = UPhotonOnlineSubsystemSettings::GetPhotonOnlineSettings();
+	const UFusionOnlineSubsystemSettings* SubSystemSettings = UFusionOnlineSubsystemSettings::GetPhotonOnlineSettings();
 
 	// Start of post init property checks that override those found in PhotonOnlineSubsystemSettings.h
 	

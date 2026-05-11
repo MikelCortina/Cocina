@@ -4,7 +4,7 @@
 #include "Physics/Experimental/PhysScene_Chaos.h"
 #include "Physics/FusionPhysicsReplicationFactory.h"
 #include "Physics/FusionPhysicsReplication.h"
-#include "Physics/PhysicsExtensions.h"
+#include "Physics/FusionPhysicsExtensions.h"
 #include "Engine/World.h"
 #include "Components/PrimitiveComponent.h"
 #include "Physics/FusionPhysicsReplicationComponent.h"
@@ -58,11 +58,14 @@ void FusionPhysicsUtils::ResetReplication(const UWorld* World)
 {
 	if (!World)
 		return;
-	
-	// if (FPhysScene_Chaos* Scene = static_cast<FPhysScene_Chaos*>(world->GetPhysicsScene()))
-	// {
-	// 	Scene->SetPhysicsReplication(nullptr);
-	// }
+
+	if (FPhysScene_Chaos* Scene = World->GetPhysicsScene())
+	{
+		const TSharedPtr<IPhysicsReplicationFactory> ReplicationFactory =  MakeShared<FusionPhysicsReplicationFactory>();
+		FPhysScene_Chaos::PhysicsReplicationFactory = nullptr;
+		//Creates default replication object.
+		Scene->CreatePhysicsReplication();
+	}
 }
 
 FusionPhysicsReplication* FusionPhysicsUtils::GetReplication(const UWorld* World)
@@ -72,7 +75,13 @@ FusionPhysicsReplication* FusionPhysicsUtils::GetReplication(const UWorld* World
 	
 	if (FPhysScene_Chaos* Scene = World->GetPhysicsScene())
 	{
-		return static_cast<FusionPhysicsReplication*>(Scene->GetPhysicsReplication());
+		if (IPhysicsReplication* Replication = Scene->GetPhysicsReplication())
+		{
+			if (FPhysScene_Chaos::PhysicsReplicationFactory.IsValid())
+			{
+				return static_cast<FusionPhysicsReplication*>(Replication);
+			}
+		}
 	}
 
 	return nullptr;

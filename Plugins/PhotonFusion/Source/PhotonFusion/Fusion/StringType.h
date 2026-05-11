@@ -3,6 +3,7 @@
 #pragma once
 
 #include <charconv>
+#include <limits>
 #include <string>
 #include <type_traits>
 

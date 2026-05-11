@@ -30,11 +30,15 @@ public class PhotonFusionEditor : ModuleRules
 				"PropertyEditor",
 				"InputCore",
 				"UnrealEd",
-				"KismetCompiler", 
+				"KismetCompiler",
 				"Kismet",
 				"GraphEditor",
 				"PhotonFusion",
-				"Projects"
+				"Projects",
+				// Used by Fusion Debug Tools (bandwidth monitor, string heap viewer)
+				"ToolMenus",
+				"WorkspaceMenuStructure",
+				"EditorFramework"
 			}
 		);
 		

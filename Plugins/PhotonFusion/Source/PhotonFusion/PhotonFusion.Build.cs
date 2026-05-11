@@ -67,6 +67,12 @@ public class PhotonFusion : ModuleRules {
 			libPrefix = "lib";
 			libExtension = ".a";
 		}
+		else if (Target.Platform == UnrealTargetPlatform.Linux)
+		{
+			fusionPlatform = "unix";
+			libPrefix = "lib";
+			libExtension = ".a";
+		}
 		else
 		{
 			throw new Exception("\nTarget platform not yet supported: " + Target.Platform);
@@ -97,7 +103,8 @@ public class PhotonFusion : ModuleRules {
 		{
 			foreach (string library in photonLibraries)
 			{
-				string libraryName = libPrefix + library + "_" + fusionPlatform + "_" + fusionArch + "_" + fusionConfig + libExtension;
+				string libSuffix = (fusionPlatform == "windows") ? "_md" : "";
+				string libraryName = libPrefix + library + "_" + fusionPlatform + "_" + fusionArch + "_" + fusionConfig + libSuffix + libExtension;
 				string libraryPath =
 					Path.Combine(ModuleDirectory, "Fusion", "lib", fusionPlatform, fusionArch, libraryName);
 
@@ -169,11 +176,11 @@ public class PhotonFusion : ModuleRules {
 		{
 			if (Target.Architectures.Architectures[i] == UnrealArch.X64)
 			{
-				PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "android", "x86_64", "lib" + name + "_release_android_x86_64_libc++_no-rtti.a"));
+				PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "android", "x86_64", "lib" + name + "_release_android_x86_64_no-rtti.a"));
 			} 
 			else if (Target.Architectures.Architectures[i] == UnrealArch.Arm64)
 			{
-				PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "android", "arm64-v8a", "lib" + name + "_release_android_arm64-v8a_libc++_no-rtti.a"));
+				PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "android", "arm64-v8a", "lib" + name + "_release_android_arm64-v8a_no-rtti.a"));
 			}
 			else
 			{
@@ -192,6 +199,11 @@ public class PhotonFusion : ModuleRules {
 	private void AddPhotonLibPathMac(ReadOnlyTargetRules Target, string name)
 	{
 		PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "darwin", "universal", "lib" + name + "_release_macosx.a"));
+	}
+
+	private void AddPhotonLibPathLinux(ReadOnlyTargetRules Target, string name)
+	{
+		PublicAdditionalLibraries.Add(Path.Combine(PhotonPath, "lib", "unix", "x86_64", "lib" + name + "Release64.a"));
 	}
 	
 	public bool LoadPhoton(ReadOnlyTargetRules Target)
@@ -228,6 +240,13 @@ public class PhotonFusion : ModuleRules {
 			AddPhotonLibPathMac(Target, "Photon-cpp");
 			AddPhotonLibPathMac(Target, "LoadBalancing-cpp");
 			AddPhotonLibPathMac(Target, "crypto");
+		}
+		else if (Target.Platform == UnrealTargetPlatform.Linux)
+		{
+			PublicDefinitions.Add("_EG_LINUX_PLATFORM");
+			AddPhotonLibPathLinux(Target, "Common");
+			AddPhotonLibPathLinux(Target, "Photon");
+			AddPhotonLibPathLinux(Target, "LoadBalancing");
 		}
 		else
 		{

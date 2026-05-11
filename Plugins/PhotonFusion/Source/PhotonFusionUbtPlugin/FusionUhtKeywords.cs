@@ -50,14 +50,10 @@ namespace FusionUbtPlugin
     [UnrealHeaderTool]
     internal static class FusionUhtKeywords
     {
-	    public static readonly string TargetMasterClient = nameof(FusionUhtFunctionSpecifiers.TargetMasterClient);
-	    public static readonly string TargetAllClients = nameof(FusionUhtFunctionSpecifiers.TargetAllClients);
-	    public static readonly string TargetObjectOwner = nameof(FusionUhtFunctionSpecifiers.TargetObjectOwner);
-	    public static readonly string TargetEveryoneElse = nameof(FusionUhtFunctionSpecifiers.TargetEveryoneElse);
-	    
 	    public static Dictionary<string, List<FusionRPCFunctionData>> parsedFunctions = new Dictionary<string, List<FusionRPCFunctionData>>();
 	    public static Dictionary<string, FusionBodyData> bodyData = new Dictionary<string, FusionBodyData>();
-	    
+	    private static readonly object collectionsLock = new();
+
 	    [UhtKeyword(Extends = UhtTableNames.Class)]
 	    [UhtKeyword(Extends = UhtTableNames.Interface)]
 	    [UhtKeyword(Extends = UhtTableNames.NativeInterface)]
@@ -66,11 +62,6 @@ namespace FusionUbtPlugin
 	    private static UhtParseResult SEND_FUSIONRPCKeyword(UhtParsingScope parentScope, UhtParsingScope actionScope, ref UhtToken token)
 	    {
 		    UhtSpecifierTable table = parentScope.Session.GetSpecifierTable(UhtTableNames.Function);
-		    AddHandler(table, TargetMasterClient);
-		    AddHandler(table, TargetAllClients);
-		    AddHandler(table, TargetObjectOwner);
-		    AddHandler(table, TargetEveryoneElse);
-		    
 		    return ParseFunction(parentScope, actionScope, table, ref token);
 	    }
 
@@ -91,7 +82,10 @@ namespace FusionUbtPlugin
 	        if (actionScope.ScopeType is UhtClass classObj)
 	        {
 		        FusionBodyData data = new(topScope.TokenReader.InputLine);
-		        bodyData[classObj.SourceName] = data;
+		        lock (collectionsLock)
+		        {
+			        bodyData[classObj.SourceName] = data;
+		        }
 	        }
 	  
 	        return UhtParseResult.Handled;
@@ -393,14 +387,16 @@ namespace FusionUbtPlugin
 		    if (function.Outer != null)
 		    {
 			    FusionRPCFunctionData functionData = new(function, receiveFunction);
-			    if (parsedFunctions.ContainsKey(function.Outer.SourceName))
+			    lock (collectionsLock)
 			    {
-				    parsedFunctions[function.Outer.SourceName].Add(functionData);
-			    }
-			    else
-			    {
-				    List<FusionRPCFunctionData> functions = new List<FusionRPCFunctionData>() { functionData };
-				    parsedFunctions.Add(function.Outer.SourceName, functions);
+				    if (parsedFunctions.TryGetValue(function.Outer.SourceName, out List<FusionRPCFunctionData>? functions))
+				    {
+					    functions.Add(functionData);
+				    }
+				    else
+				    {
+					    parsedFunctions.Add(function.Outer.SourceName, new List<FusionRPCFunctionData> { functionData });
+				    }
 			    }
 		    }
 
@@ -436,68 +432,7 @@ namespace FusionUbtPlugin
 			    propertySettings.TypeTokens = parameter.TypeTokens;
 #endif
 				
-			    UhtProperty? clonedProperty = null;
-			    switch (parameter)
-			    {
-				    case UhtBoolProperty boolProperty:
-					    {
-						    clonedProperty = new UhtBoolProperty(propertySettings, boolProperty.BoolType);
-						    break;
-					    }
-				    case UhtIntProperty intProperty:
-					    {
-						    clonedProperty = new UhtIntProperty(propertySettings);
-						    break;
-					    }
-				    case UhtFloatProperty floatProperty:
-					    {
-						    clonedProperty = new UhtFloatProperty(propertySettings);
-						    break;
-					    }
-				    case UhtDoubleProperty doubleProperty:
-					    {
-						    clonedProperty = new UhtDoubleProperty(propertySettings);
-						    break;
-					    }
-				    // case UhtAnsiStrProperty ansiProperty:
-					   //  {
-						  //   clonedProperty = new UhtAnsiStrProperty(propertySettings);
-						  //   break;
-					   //  }
-				    case UhtStrProperty strProperty:
-					    {
-						    clonedProperty = new UhtStrProperty(propertySettings);
-						    break;
-					    }
-				    case UhtEnumProperty enumProperty:
-					    {
-						    clonedProperty = new UhtEnumProperty(propertySettings, enumProperty.Enum);
-						    break;
-					    }
-				    case FusionPreResolveProperty preResolveProperty:
-					    {
-						    #if UE_5_6_OR_LATER
-						    clonedProperty = new FusionPreResolveProperty(propertySettings, preResolveProperty.PropertySettings.TypeTokens.AllTokens);
-							#else
-						    clonedProperty = new FusionPreResolveProperty(propertySettings, preResolveProperty.TypeTokens);
-						    #endif
-						    break;
-					    }
-				    case UhtPreResolveProperty preResolveProperty:
-					    {
-							#if UE_5_6_OR_LATER
-						    clonedProperty = new UhtPreResolveProperty(propertySettings);
-							#else
-						    clonedProperty = new UhtPreResolveProperty(propertySettings, preResolveProperty.TypeTokens);
-							#endif
-						    break;
-					    }
-			    }
-
-			    if (clonedProperty == null)
-			    {
-				    throw new Exception($"Unable to copy property: {parameter}");
-			    }
+			    UhtProperty clonedProperty = CloneProperty(parameter, propertySettings);
 			    
 			    clonedProperty.Outer = receiveFunction;
 			    clonedProperty.PropertyFlags = parameter.PropertyFlags;
@@ -512,6 +447,45 @@ namespace FusionUbtPlugin
 		    }
 
 		    return receiveFunction;
+	    }
+
+	    private static UhtProperty CloneProperty(UhtProperty parameter, UhtPropertySettings settings)
+	    {
+		    // Types that require extra constructor arguments
+		    switch (parameter)
+		    {
+			    case UhtBoolProperty p:
+				    return new UhtBoolProperty(settings, p.BoolType);
+			    case UhtEnumProperty p:
+				    return new UhtEnumProperty(settings, p.Enum);
+			    case UhtByteProperty p:
+#if UE_5_7_OR_LATER
+				    return new UhtByteProperty(settings, enumObj: p.Enum);
+#else
+				    return new UhtByteProperty(settings, p.Enum);
+#endif
+			    case FusionPreResolveProperty p:
+#if UE_5_6_OR_LATER
+				    return new FusionPreResolveProperty(settings, p.PropertySettings.TypeTokens.AllTokens);
+#else
+				    return new FusionPreResolveProperty(settings, p.TypeTokens);
+#endif
+			    case UhtPreResolveProperty p:
+#if UE_5_6_OR_LATER
+				    return new UhtPreResolveProperty(settings);
+#else
+				    return new UhtPreResolveProperty(settings, p.TypeTokens);
+#endif
+		    }
+
+		    // Simple types: clone via constructor(UhtPropertySettings)
+		    ConstructorInfo? ctor = parameter.GetType().GetConstructor(new[] { typeof(UhtPropertySettings) });
+		    if (ctor != null)
+		    {
+			    return (UhtProperty)ctor.Invoke(new object[] { settings });
+		    }
+
+		    throw new Exception($"Unable to clone property of type {parameter.GetType().Name}: {parameter}");
 	    }
 
 	    private static void AddHiddenProperty(UhtParsingScope parentScope, UhtParsingScope actionScope, string receiveFunctionName)
@@ -544,26 +518,6 @@ namespace FusionUbtPlugin
 			    }
 		    }
 	    }
-
-	    private static void AddHandler(UhtSpecifierTable table, string name)
-	    {
-		    if (!table.TryGetValue(name, out _))
-		    {
-			    Type classType = typeof(FusionUhtFunctionSpecifiers);
-			    MethodInfo? methodInfo = classType.GetMethod(name,
-				    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-					    
-			    if (methodInfo != null)
-			    {
-				    UhtSpecifierOptionalStringDelegate handlerDelegate =
-					    (UhtSpecifierOptionalStringDelegate)Delegate.CreateDelegate(
-						    typeof(UhtSpecifierOptionalStringDelegate), methodInfo);
-						    
-				    table.Add(new UhtSpecifierOptionalString(name, UhtSpecifierWhen.Deferred, handlerDelegate));
-			    }
-		    }
-	    }
-	    
 
         private static void PropertyParsed(UhtParsingScope topScope, UhtProperty property, ref UhtToken nameToken, UhtLayoutMacroType layoutMacroType)
         {

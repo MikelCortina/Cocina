@@ -10,7 +10,13 @@
 #include "Engine/Engine.h"
 #include "FusionHelpers.generated.h"
 
-class UFunctionDescriptor;
+namespace FusionCore
+{
+	struct Data;
+}
+
+class UFusionFunctionDescriptor;
+class FJsonObject;
 
 UENUM(BlueprintType)
 enum class EFusionRPCTarget : uint8
@@ -59,54 +65,60 @@ enum class EFusionInstanceType : uint8
 };
 
 
+
 USTRUCT()
 struct FKeyObjectId
 {
 	GENERATED_BODY()
 
-	SharedMode::PlayerId Origin{ 0 };
+	FusionCore::PlayerId Origin{ 0 };
+	FusionCore::Map Map{ 0 };
 	uint32 Counter{ 0 };
 
 	FKeyObjectId() = default;
 
-	FKeyObjectId(const SharedMode::PlayerId OriginValue, const uint32 CounterValue)
+	FKeyObjectId(const FusionCore::PlayerId OriginValue, const FusionCore::Map MapValue, const uint32 CounterValue)
 	{
 		Origin = OriginValue;
+		Map = MapValue;
 		Counter = CounterValue;
 	}
 
 	// ReSharper disable once CppNonExplicitConvertingConstructor
-	FKeyObjectId(const SharedMode::ObjectId& ObjectId)
-	: Origin(ObjectId.Origin), Counter(ObjectId.Counter) {}
+	FKeyObjectId(const FusionCore::ObjectId& ObjectId)
+	: Origin(ObjectId.Origin), Map(ObjectId.Map), Counter(ObjectId.Counter) {}
 
 	// ReSharper disable once CppNonExplicitConversionOperator
-	operator SharedMode::ObjectId() const
+	operator FusionCore::ObjectId() const
 	{
-		SharedMode::ObjectId Result;
+		FusionCore::ObjectId Result;
 		Result.Origin = Origin;
+		Result.Map = Map;
 		Result.Counter = Counter;
 		return Result;
 	}
 
 	explicit FKeyObjectId(const uint64& packed)
 	{
-		Origin = static_cast<SharedMode::PlayerId>(packed & UINT32_MAX);
+		Origin = static_cast<FusionCore::PlayerId>(packed & UINT16_MAX);
+		Map = static_cast<FusionCore::Map>((packed >> 16) & UINT16_MAX);
 		Counter = static_cast<uint32>(packed >> 32);
 	}
 
-	FKeyObjectId& operator=(const SharedMode::ObjectId& Other)
+	FKeyObjectId& operator=(const FusionCore::ObjectId& Other)
 	{
 		Origin = Other.Origin;
+		Map = Other.Map;
 		Counter = Other.Counter;
 		return *this;
 	}
 
-	bool IsNone() const { return Origin == 0 && Counter == 0; }
-	bool IsSome() const { return Origin != 0 || Counter != 0; }
+	bool IsNone() const { return Origin == 0 && Counter == 0 && Map == 0; }
+	bool IsSome() const { return Origin != 0 || Counter != 0 || Map != 0; }
 
 	bool operator==(const FKeyObjectId& Other) const
 	{
-		return Origin == Other.Origin && Counter == Other.Counter;
+		return Origin == Other.Origin && Map == Other.Map && Counter == Other.Counter;
 	}
 
 	bool operator!=(const FKeyObjectId& Other) const
@@ -141,10 +153,10 @@ public:
 	static void InvokeCustomRPC(UObject* Source, FString EventName, int32 RPCId, EFusionRPCTarget Target, const TArray<uint8>& Buffer);
 
 	UFUNCTION(BlueprintCallable, Category = "Fusion")
-	static UFunctionDescriptor* GetFunctionDescriptor(UObject* Source, FString EventName);
+	static UFusionFunctionDescriptor* GetFunctionDescriptor(UObject* Source, FString EventName);
 	
 	UFUNCTION(BlueprintCallable, Category = "Fusion", CustomThunk, meta=(CustomStructureParam="Value"))
-	static void AddParamToBuffer(const int32& Value, UObject* Source, UFunctionDescriptor* Descriptor, int32 PropertyIndex, UPARAM(ref) TArray<uint8>& Buffer);
+	static void AddParamToBuffer(const int32& Value, UObject* Source, UFusionFunctionDescriptor* Descriptor, int32 PropertyIndex, UPARAM(ref) TArray<uint8>& Buffer);
 	
 	DECLARE_FUNCTION(execAddParamToBuffer);
 
@@ -179,6 +191,8 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Fusion")
 	static bool DestroyActorComponent(UActorComponent* Component);
+
+	static TSharedPtr<FJsonObject> DeserializeMapPayload(const FString PayloadString);
 };
 
 

@@ -43,7 +43,7 @@ namespace FusionUbtPlugin.UHT.Generators
 					//Hardcoded for now, move into const lookup thingy later.
 					builder.Append("#include \"").Append("FusionOnlineSubsystem.h").Append("\"\r\n");
 					builder.Append("#include \"").Append("FusionHelpers.h").Append("\"\r\n");
-					builder.Append("#include \"").Append("Types/TypeDescriptor.h").Append("\"\r\n");
+					builder.Append("#include \"").Append("Types/FusionTypeDescriptor.h").Append("\"\r\n");
 					
 					builder.Append("#include \"").Append("Kismet/GameplayStatics.h").Append("\"\r\n");
 					builder.Append("#include \"").Append("Engine/GameInstance.h").Append("\"\r\n");
@@ -110,7 +110,7 @@ namespace FusionUbtPlugin.UHT.Generators
 
 			if (registrations.Count > 0)
 			{
-				builder.Append("#include \"Types/PropertyHelpers.h\"\r\n");
+				builder.Append("#include \"Types/FusionPropertyHelpers.h\"\r\n");
 				builder.Append("static struct FFusionArraySizeRegistrar_").Append(Path.GetFileNameWithoutExtension(HeaderFile.FilePath)).Append(" {\r\n");
 				builder.Append("\tFFusionArraySizeRegistrar_").Append(Path.GetFileNameWithoutExtension(HeaderFile.FilePath)).Append("() {\r\n");
 				foreach (var (ownerName, propertyName, size) in registrations)
@@ -323,7 +323,7 @@ namespace FusionUbtPlugin.UHT.Generators
 			int hashInt32 = (int)(hash & 0x7FFFFFFF);
 			
 			builder.Append("TArray<uint8> Buffer; \r\n");
-            builder.Append($"UFunctionDescriptor* Descriptor = UFusionHelpers::GetFunctionDescriptor(this, \"{functionData.ReceiveFunction.CppImplName}\"); \r\n");
+            builder.Append($"UFusionFunctionDescriptor* Descriptor = UFusionHelpers::GetFunctionDescriptor(this, \"{functionData.ReceiveFunction.CppImplName}\"); \r\n");
             builder.Append("if (!Descriptor)\r\n");
             builder.Append("{\r\n");
             builder.Append("\tUE_LOG(LogTemp, Warning, TEXT(\"Missing Function Descriptor for Fusion RPC in '%s'. Make sure the Actor is set to replicate.\"), *GetName());\r\n");
